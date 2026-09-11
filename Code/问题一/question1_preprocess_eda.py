@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """问题1：附件1数据预处理、探索性数据分析（EDA）与空白结果表生成。
 
-运行示例：
-    python question1_preprocess_eda.py --input 附件1.xlsx --output-dir question1_output
+在 VS Code 中可直接运行当前文件。默认读取仓库“附件”目录中的附件1.xlsx，
+并将结果保存到本脚本所在的“问题一”目录。
 
 时间约定：附件1采用右端点记时。原始时刻 0:10 表示区间 0:00-0:10，
 原始时刻 0:00+1 表示区间 23:50-24:00。
@@ -13,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 import warnings
 from datetime import datetime, time
 from pathlib import Path
@@ -28,11 +28,18 @@ import pandas as pd
 import seaborn as sns
 
 
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 # ------------------------------ 全局配置 ------------------------------
 DT_HOURS = 1.0 / 6.0
 EXPECTED_ROWS = 144
 EXPECTED_STEP_MINUTES = 10
 SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
+ATTACHMENT_DIR = PROJECT_ROOT / "附件"
 
 REQUIRED_COLUMNS = ["时间", "电价", "小区负载", "光伏发电预测功率"]
 NUMERIC_COLUMNS = ["电价", "小区负载", "光伏发电预测功率"]
@@ -386,8 +393,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         type=Path,
-        default=SCRIPT_DIR / "附件1.xlsx",
-        help="附件1.xlsx 的路径（默认：脚本所在目录/附件1.xlsx）",
+        default=ATTACHMENT_DIR / "附件1.xlsx",
+        help="附件1.xlsx 的路径（默认：仓库根目录/附件/附件1.xlsx）",
     )
     parser.add_argument(
         "--output-dir",

@@ -1,11 +1,11 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """2026 C题问题1：微网全天计划购电与储能充放电优化。
 
 依赖：
     pip install pandas numpy scipy openpyxl
 
-默认运行方式（附件1.xlsx、result1.xlsx 与本脚本在同一目录）：
+在 VS Code 中可直接运行当前文件。默认从仓库“附件”目录读取附件1.xlsx，
+从“附件/附件5”读取result1.xlsx，结果仍保存到本脚本所在的“问题一”目录：
     python solve_question1.py
 
 指定路径：
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from datetime import datetime, time
 from pathlib import Path
 
@@ -32,6 +33,11 @@ import pandas as pd
 from openpyxl import load_workbook
 from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.sparse import lil_matrix, vstack
+
+
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 T = 144
@@ -43,6 +49,11 @@ SOC_MIN = 1200.0
 SOC_MAX = 10800.0
 POWER_MAX_KW = 5000.0
 ENERGY_MAX_KWH = POWER_MAX_KW * DT
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
+ATTACHMENT_DIR = PROJECT_ROOT / "附件"
+TEMPLATE_DIR = ATTACHMENT_DIR / "附件5"
 
 REQUIRED_COLUMNS = ["时间", "电价", "小区负载", "光伏发电预测功率"]
 
@@ -316,10 +327,16 @@ def print_summary(df: pd.DataFrame, solution: dict[str, np.ndarray | float]) -> 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="求解C题问题1并填充result1模板")
-    parser.add_argument("--data", type=Path, default=Path("附件1.xlsx"))
-    parser.add_argument("--template", type=Path, default=Path("result1.xlsx"))
     parser.add_argument(
-        "--output", type=Path, default=Path("result1_问题1求解结果.xlsx")
+        "--data", type=Path, default=ATTACHMENT_DIR / "附件1.xlsx"
+    )
+    parser.add_argument(
+        "--template", type=Path, default=TEMPLATE_DIR / "result1.xlsx"
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=SCRIPT_DIR / "result1_问题1求解结果.xlsx",
     )
     return parser.parse_args()
 
