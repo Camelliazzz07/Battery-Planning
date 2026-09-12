@@ -44,6 +44,8 @@ AUXILIARY_DIR = SCRIPT_DIR / "辅助输出"
 
 REQUIRED_COLUMNS = ["时间", "电价", "小区负载", "光伏发电预测功率"]
 NUMERIC_COLUMNS = ["电价", "小区负载", "光伏发电预测功率"]
+COOL_PALETTE = ["#BFDFD2", "#51999F", "#4198AC", "#7BC0CD"]
+WARM_PALETTE = ["#DBCB92", "#ECB66C", "#EA9E58", "#ED8D5A"]
 
 sns.set_theme(style="whitegrid")
 
@@ -55,6 +57,7 @@ plt.rcParams["font.sans-serif"] = [
     "DejaVu Sans",
 ]
 plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams["svg.fonttype"] = "none"
 
 
 # -------------------------- 模块1：读取与时间解析 --------------------------
@@ -208,15 +211,17 @@ def plot_combined_time_series(df: pd.DataFrame, output_path: Path) -> None:
     fig, ax_left = plt.subplots(figsize=(15, 7.5))
     x = df["区间编号"].to_numpy()
 
-    ax_left.plot(x, df["小区负载"], color="#2563EB", lw=2.0, label="小区负载 (kW)")
+    ax_left.plot(
+        x, df["小区负载"], color=COOL_PALETTE[1], lw=2.0, label="小区负载 (kW)"
+    )
     ax_left.plot(
         x,
         df["光伏发电预测功率"],
-        color="#F59E0B",
+        color=WARM_PALETTE[1],
         lw=2.0,
         label="光伏发电预测功率 (kW)",
     )
-    ax_left.plot(x, df["净负荷_kW"], color="#16A34A", lw=2.0, label="净负荷 (kW)")
+    ax_left.plot(x, df["净负荷_kW"], color=COOL_PALETTE[2], lw=2.0, label="净负荷 (kW)")
     ax_left.set_xlabel("区间编号（1-144）")
     ax_left.set_ylabel("功率 (kW)")
     ax_left.set_xlim(1, len(df))
@@ -227,13 +232,13 @@ def plot_combined_time_series(df: pd.DataFrame, output_path: Path) -> None:
         x,
         df["电价"],
         where="mid",
-        color="#DC2626",
+        color=WARM_PALETTE[3],
         lw=1.8,
         alpha=0.9,
         label="电价 (元/kWh)",
     )
-    ax_right.set_ylabel("电价 (元/kWh)", color="#B91C1C")
-    ax_right.tick_params(axis="y", labelcolor="#B91C1C")
+    ax_right.set_ylabel("电价 (元/kWh)", color=WARM_PALETTE[3])
+    ax_right.tick_params(axis="y", labelcolor=WARM_PALETTE[3])
 
     tick_positions = np.arange(1, len(df) + 1, 12)
     ax_left.set_xticks(tick_positions)
@@ -251,7 +256,7 @@ def plot_combined_time_series(df: pd.DataFrame, output_path: Path) -> None:
     )
     ax_left.set_title("问题1：负载、光伏、净负荷与电价的时间对齐")
     fig.tight_layout()
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    fig.savefig(output_path, format="svg", bbox_inches="tight")
     plt.close(fig)
     print(f"[绘图] 已保存：{output_path}")
 
@@ -262,7 +267,7 @@ def plot_net_load_regions(df: pd.DataFrame, output_path: Path) -> None:
     x = df["区间编号"].to_numpy(dtype=float)
     net_load = df["净负荷_kW"].to_numpy(dtype=float)
 
-    ax.plot(x, net_load, color="#334155", lw=2.1, label="净负荷 (kW)")
+    ax.plot(x, net_load, color=COOL_PALETTE[1], lw=2.1, label="净负荷 (kW)")
 
     ax.fill_between(
         x,
@@ -270,7 +275,7 @@ def plot_net_load_regions(df: pd.DataFrame, output_path: Path) -> None:
         net_load,
         where=(net_load > 0).tolist(),
         interpolate=True,
-        color="#EF4444",
+        color=WARM_PALETTE[3],
         alpha=0.35,
         label="净负荷 > 0（电力缺口）",
     )
@@ -280,7 +285,7 @@ def plot_net_load_regions(df: pd.DataFrame, output_path: Path) -> None:
         net_load,
         where=(net_load < 0).tolist(),
         interpolate=True,
-        color="#22C55E",
+        color=COOL_PALETTE[0],
         alpha=0.38,
         label="净负荷 < 0（光伏富余）",
     )
@@ -297,7 +302,7 @@ def plot_net_load_regions(df: pd.DataFrame, output_path: Path) -> None:
     ax.legend(loc="best", frameon=True)
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    fig.savefig(output_path, format="svg", bbox_inches="tight")
     plt.close(fig)
     print(f"[绘图] 已保存：{output_path}")
 
@@ -333,8 +338,8 @@ def save_outputs(df: pd.DataFrame, output_dir: Path) -> None:
 
     clean_csv = output_dir / "附件1_clean.csv"
     blank_result_xlsx = output_dir / "result1_blank.xlsx"
-    combined_png = output_dir / "问题1_时间序列综合图.png"
-    net_load_png = output_dir / "问题1_净负荷分区图.png"
+    combined_svg = output_dir / "问题1_时间序列综合图.svg"
+    net_load_svg = output_dir / "问题1_净负荷分区图.svg"
 
     df.to_csv(clean_csv, index=False, encoding="utf-8-sig")
     print(f"[输出] 已保存：{clean_csv}")
@@ -358,8 +363,8 @@ def save_outputs(df: pd.DataFrame, output_dir: Path) -> None:
         f"附件第{source_order[-1]}点（原始时刻 {df.loc[source_order[-1]-1, '时间']}）"
     )
 
-    plot_combined_time_series(df, combined_png)
-    plot_net_load_regions(df, net_load_png)
+    plot_combined_time_series(df, combined_svg)
+    plot_net_load_regions(df, net_load_svg)
 
 
 def print_summary(
