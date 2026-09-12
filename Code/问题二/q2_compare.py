@@ -6,7 +6,7 @@ pip install numpy pandas scipy openpyxl matplotlib seaborn
 
 依赖同目录q2_run_model.py。所有方案共同用旧策略预热1月，不重置SOC。
 比较是固定参数的历史回测，不是未知数据上的效果保证；不根据全年结果自动调参。
-输出费用对照CSV/MD、约束检查、预测覆盖率及4张SVG英文图。
+输出费用对照CSV/MD、约束检查、预测覆盖率及4张中文SVG图。
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import pandas as pd
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import seaborn as sns
 from openpyxl import load_workbook
@@ -38,20 +39,43 @@ AUXILIARY_DIR = SCRIPT_DIR / "辅助输出"
 
 VARIANTS = ["baseline", "forecast_only", "soc_only", "revised"]
 LABELS = {
-    "baseline": "Original",
-    "forecast_only": "Forecast only",
-    "soc_only": "SOC only",
-    "revised": "Revised",
+    "baseline": "原模型",
+    "forecast_only": "仅改进预测",
+    "soc_only": "仅改进储能策略",
+    "revised": "完整改进模型",
 }
 COOL_PALETTE = ["#BFDFD2", "#51999F", "#4198AC", "#7BC0CD"]
 WARM_PALETTE = ["#DBCB92", "#ECB66C", "#EA9E58", "#ED8D5A"]
 VARIANT_COLORS = {
     "baseline": COOL_PALETTE[1],
-    "forecast_only": WARM_PALETTE[1],
-    "soc_only": COOL_PALETTE[2],
+    "forecast_only": WARM_PALETTE[0],
+    "soc_only": COOL_PALETTE[3],
     "revised": WARM_PALETTE[3],
 }
-plt.rcParams["svg.fonttype"] = "none"
+sns.set_theme(style="whitegrid", context="notebook")
+plt.rcParams.update(
+    {
+        "font.sans-serif": [
+            "Microsoft YaHei",
+            "SimHei",
+            "Noto Sans CJK SC",
+            "Arial Unicode MS",
+            "DejaVu Sans",
+        ],
+        "axes.unicode_minus": False,
+        "axes.edgecolor": "#777777",
+        "axes.labelcolor": "#333333",
+        "axes.titleweight": "semibold",
+        "axes.titlesize": 13,
+        "xtick.color": "#4A4A4A",
+        "ytick.color": "#4A4A4A",
+        "grid.color": "#D9D9D9",
+        "grid.alpha": 0.55,
+        "grid.linewidth": 0.7,
+        "legend.frameon": False,
+        "svg.fonttype": "none",
+    }
+)
 
 
 def checks(ts, daily, events, path, variant):
@@ -361,38 +385,49 @@ def main():
     pd.DataFrame(monthly_rows).to_csv(
         args.output_dir / "q2_monthly_comparison.csv", index=False, encoding="utf-8-sig"
     )
-    sns.set_theme(style="whitegrid", context="notebook")
     colors = [VARIANT_COLORS[variant] for variant in VARIANTS]
     names = [LABELS[v] for v in VARIANTS]
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(10.5, 5.4), layout="constrained")
     x = np.arange(4)
     ax.bar(
         x,
         result["计划购电费_元"] / 1e6,
-        label="Planned purchase",
+        label="计划购电费",
         color=COOL_PALETTE[2],
+        width=0.62,
     )
     ax.bar(
         x,
         result["紧急购电费_元"] / 1e6,
         bottom=result["计划购电费_元"] / 1e6,
-        label="Emergency purchase",
+        label="紧急购电费",
         color=WARM_PALETTE[3],
+        width=0.62,
     )
     ax.set_xticks(x, names)
-    ax.set_ylabel("Cost (million CNY)")
-    ax.set_title("Billed cost: 2025-02-01 to 2025-12-31")
+    ax.set_ylabel("购电费用（百万元）")
+    ax.set_title("不同方案购电费用对比（2025年2月1日—12月31日）", pad=12)
+    ymax = float(result["总购电费_元"].max() / 1e6)
+    ax.set_ylim(0, ymax * 1.16)
     for i, v in enumerate(result["总购电费_元"]):
-        ax.text(i, v / 1e6 + 0.05, f"{v/1e6:.3f}", ha="center")
-    ax.legend()
-    fig.tight_layout()
+        ax.text(
+            i,
+            v / 1e6 + ymax * 0.025,
+            f"{v / 1e6:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            color="#333333",
+        )
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0))
+    ax.spines[["top", "right"]].set_visible(False)
     fig.savefig(
         args.output_dir / "01_cost_comparison.svg",
         format="svg",
         bbox_inches="tight",
     )
     plt.close(fig)
-    fig, ax = plt.subplots(figsize=(11, 4))
+    fig, ax = plt.subplots(figsize=(11.5, 4.8), layout="constrained")
     for variant in VARIANTS[1:]:
         saving = (
             all_daily["baseline"]["总购电费_元"] - all_daily[variant]["总购电费_元"]
@@ -402,19 +437,26 @@ def main():
             saving.cumsum() / 1e4,
             label=LABELS[variant],
             color=VARIANT_COLORS[variant],
+            lw=2.0 if variant == "revised" else 1.55,
+            alpha=1.0 if variant == "revised" else 0.88,
         )
-    ax.axhline(0, color="gray", lw=0.7)
-    ax.set_ylabel("Cumulative saving (10,000 CNY)")
-    ax.legend()
-    ax.set_title("Savings against original model")
-    fig.tight_layout()
+    ax.axhline(0, color="#666666", lw=0.8, ls="--")
+    ax.set_xlabel("日期")
+    ax.set_ylabel("累计节约费用（万元）")
+    ax.set_title("各改进方案相对原模型的累计节约费用", pad=12)
+    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[2, 4, 6, 8, 10, 12]))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m月"))
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0))
+    ax.spines[["top", "right"]].set_visible(False)
     fig.savefig(
         args.output_dir / "02_cumulative_savings.svg",
         format="svg",
         bbox_inches="tight",
     )
     plt.close(fig)
-    fig, axs = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+    fig, axs = plt.subplots(
+        2, 1, figsize=(11.5, 7.2), sharex=True, layout="constrained"
+    )
     for variant in ["baseline", "revised"]:
         d = all_daily[variant]
         color = VARIANT_COLORS[variant]
@@ -423,40 +465,69 @@ def main():
             d["计划日末SOC_kWh"],
             label=LABELS[variant],
             color=color,
-            alpha=0.85,
+            alpha=0.92,
+            lw=1.65,
         )
         axs[1].plot(
             d["日期"],
             d["期末SOC_kWh"],
             label=LABELS[variant],
             color=color,
-            alpha=0.85,
+            alpha=0.92,
+            lw=1.65,
         )
-    for ax, label in zip(
-        axs, ["Planned day-end energy (kWh)", "Actual day-end energy (kWh)"]
-    ):
+    for ax in axs:
         ax.axhline(
             6000,
-            color="gray",
+            color="#666666",
             ls="--",
-            lw=0.8,
-            label="6000 reference (not v2 constraint)",
+            lw=0.9,
+            label="6000 kWh参考线（非模型约束）",
         )
-        ax.set_ylabel(label)
-        ax.legend(fontsize=8)
-    fig.tight_layout()
+        ax.spines[["top", "right"]].set_visible(False)
+    axs[0].set_title("计划日末储能电量", pad=9)
+    axs[1].set_title("实际日末储能电量", pad=9)
+    axs[0].set_ylabel("储能电量（kWh）")
+    axs[1].set_ylabel("储能电量（kWh）")
+    axs[1].set_xlabel("日期")
+    axs[1].xaxis.set_major_locator(
+        mdates.MonthLocator(bymonth=[2, 4, 6, 8, 10, 12])
+    )
+    axs[1].xaxis.set_major_formatter(mdates.DateFormatter("%m月"))
+    handles, legend_labels = axs[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        legend_labels,
+        loc="center left",
+        bbox_to_anchor=(1.0, 0.5),
+        fontsize=9,
+    )
+    fig.suptitle("原模型与完整改进模型的日末储能状态", fontsize=15, fontweight="semibold")
     fig.savefig(
         args.output_dir / "03_day_end_soc.svg", format="svg", bbox_inches="tight"
     )
     plt.close(fig)
-    fig, axs = plt.subplots(1, 2, figsize=(11, 4))
-    axs[0].bar(names, result["紧急购电量_kWh"] / 1e3, color=colors)
-    axs[0].set_ylabel("Emergency energy (MWh)")
-    axs[1].bar(names, result["总剩余电量_kWh"] / 1e3, color=colors)
-    axs[1].set_ylabel("Total surplus energy (MWh)")
+    fig, axs = plt.subplots(1, 2, figsize=(12.2, 4.9), layout="constrained")
+    emergency_bars = axs[0].bar(
+        names, result["紧急购电量_kWh"] / 1e3, color=colors, width=0.62
+    )
+    surplus_bars = axs[1].bar(
+        names, result["总剩余电量_kWh"] / 1e3, color=colors, width=0.62
+    )
+    axs[0].set_title("各方案紧急购电量", pad=10)
+    axs[0].set_ylabel("紧急购电量（MWh）")
+    axs[1].set_title("各方案剩余电量", pad=10)
+    axs[1].set_ylabel("累计剩余电量（MWh）")
+    for ax, bars in zip(axs, (emergency_bars, surplus_bars)):
+        ax.bar_label(bars, fmt="%.1f", padding=4, fontsize=8.5, color="#333333")
+        ymax = max(float(bar.get_height()) for bar in bars)
+        ax.set_ylim(0, ymax * 1.16 if ymax else 1)
+        ax.spines[["top", "right"]].set_visible(False)
     for ax in axs:
-        ax.tick_params(axis="x", rotation=20)
-    fig.tight_layout()
+        ax.tick_params(axis="x", rotation=12)
+        for label in ax.get_xticklabels():
+            label.set_horizontalalignment("right")
+    fig.suptitle("不同方案的应急购电与能量剩余情况", fontsize=15, fontweight="semibold")
     fig.savefig(
         args.output_dir / "04_emergency_and_surplus.svg",
         format="svg",
