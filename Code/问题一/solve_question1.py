@@ -4,13 +4,13 @@
 依赖：
     pip install pandas numpy scipy openpyxl
 
-在 VS Code 中可直接运行当前文件。默认从仓库“附件”目录读取附件1.xlsx，
-从“附件/附件5”读取result1.xlsx，结果仍保存到本脚本所在的“问题一”目录：
+在 VS Code 中可直接运行。默认读取“附件/附件1.xlsx”和
+“附件/附件5/result1.xlsx”，正式结果保存到“提交结果/result1.xlsx”：
     python solve_question1.py
 
 指定路径：
     python solve_question1.py --data 附件1.xlsx --template result1.xlsx \
-        --output result1_问题1求解结果.xlsx
+        --output result1.xlsx
 
 建模约定：
 1. 附件1采用右端点记时，0:10 表示 0:00-0:10；不插值、不补行。
@@ -54,6 +54,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 ATTACHMENT_DIR = PROJECT_ROOT / "附件"
 TEMPLATE_DIR = ATTACHMENT_DIR / "附件5"
+RESULT_DIR = PROJECT_ROOT / "提交结果"
 
 REQUIRED_COLUMNS = ["时间", "电价", "小区负载", "光伏发电预测功率"]
 
@@ -105,9 +106,7 @@ def read_data(path: Path) -> pd.DataFrame:
     expected_minutes = np.arange(10, 1441, 10)
     actual_minutes = df["分钟数"].to_numpy(dtype=int)
     if not np.array_equal(actual_minutes, expected_minutes):
-        raise ValueError(
-            "时间轴必须严格为10,20,...,1440分钟；请检查缺失或重复时刻。"
-        )
+        raise ValueError("时间轴必须严格为10,20,...,1440分钟；请检查缺失或重复时刻。")
 
     for column in REQUIRED_COLUMNS[1:]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
@@ -163,10 +162,11 @@ def solve_model(df: pd.DataFrame) -> dict[str, np.ndarray | float]:
     balance = lil_matrix((T, n_vars))
     balance[np.arange(T), np.arange(idx["x"].start, idx["x"].stop)] = 1.0
     balance[np.arange(T), np.arange(idx["charge"].start, idx["charge"].stop)] = -1.0
-    balance[np.arange(T), np.arange(idx["discharge"].start, idx["discharge"].stop)] = 1.0
-    net_demand = (
-        df["负载电量_kWh"].to_numpy(dtype=float)
-        - df["光伏电量_kWh"].to_numpy(dtype=float)
+    balance[np.arange(T), np.arange(idx["discharge"].start, idx["discharge"].stop)] = (
+        1.0
+    )
+    net_demand = df["负载电量_kWh"].to_numpy(dtype=float) - df["光伏电量_kWh"].to_numpy(
+        dtype=float
     )
     constraints.append(LinearConstraint(balance.tocsr(), net_demand, np.inf))
 
@@ -203,7 +203,9 @@ def solve_model(df: pd.DataFrame) -> dict[str, np.ndarray | float]:
         options={"disp": False, "mip_rel_gap": 1e-9},
     )
     if not result.success or result.x is None:
-        raise RuntimeError(f"优化失败：status={result.status}, message={result.message}")
+        raise RuntimeError(
+            f"优化失败：status={result.status}, message={result.message}"
+        )
 
     solution = result.x
     purchase = np.maximum(solution[idx["x"]], 0.0)
@@ -224,7 +226,9 @@ def solve_model(df: pd.DataFrame) -> dict[str, np.ndarray | float]:
     }
 
 
-def validate_solution(df: pd.DataFrame, solution: dict[str, np.ndarray | float]) -> None:
+def validate_solution(
+    df: pd.DataFrame, solution: dict[str, np.ndarray | float]
+) -> None:
     """独立检查电量平衡、SOC递推、容量和终端约束。"""
     x = np.asarray(solution["purchase"])
     charge = np.asarray(solution["charge"])
@@ -234,7 +238,9 @@ def validate_solution(df: pd.DataFrame, solution: dict[str, np.ndarray | float])
     pv = df["光伏电量_kWh"].to_numpy()
 
     balance_slack = x + pv + discharge - load - charge
-    dynamics_error = soc[1:] - soc[:-1] - ETA_CHARGE * charge + discharge / ETA_DISCHARGE
+    dynamics_error = (
+        soc[1:] - soc[:-1] - ETA_CHARGE * charge + discharge / ETA_DISCHARGE
+    )
 
     tolerance = 1e-5
     checks = {
@@ -260,9 +266,10 @@ def fill_result_workbook(
     """保留模板结构并填入计划购电量、6段充放电量及首尾SOC。"""
     workbook = load_workbook(template_path)
     required_sheets = ["计划购电量", "充放电量"]
-    missing_sheets = [name for name in required_sheets if name not in workbook.sheetnames]
-    if missing_sheets:
-        raise KeyError(f"result1模板缺少工作表：{missing_sheets}")
+    if workbook.sheetnames != required_sheets:
+        raise ValueError(
+            f"result1模板工作表应为{required_sheets}，实际为{workbook.sheetnames}"
+        )
 
     purchase_sheet = workbook["计划购电量"]
     storage_sheet = workbook["充放电量"]
@@ -276,9 +283,13 @@ def fill_result_workbook(
     expected_first = "0:10-0:20"
     expected_last = "0:00+1-0:10+1"
     if str(purchase_sheet["A2"].value).strip() != expected_first:
-        raise ValueError(f"模板A2应为{expected_first}，实际为{purchase_sheet['A2'].value!r}")
+        raise ValueError(
+            f"模板A2应为{expected_first}，实际为{purchase_sheet['A2'].value!r}"
+        )
     if str(purchase_sheet["A145"].value).strip() != expected_last:
-        raise ValueError(f"模板A145应为{expected_last}，实际为{purchase_sheet['A145'].value!r}")
+        raise ValueError(
+            f"模板A145应为{expected_last}，实际为{purchase_sheet['A145'].value!r}"
+        )
 
     for row, value in enumerate(template_purchase, start=2):
         purchase_sheet.cell(row=row, column=2, value=round(float(value), 6))
@@ -287,8 +298,12 @@ def fill_result_workbook(
     charge_blocks = charge.reshape(6, 24).sum(axis=1)
     discharge_blocks = discharge.reshape(6, 24).sum(axis=1)
     for block in range(6):
-        storage_sheet.cell(row=block + 2, column=2, value=round(float(charge_blocks[block]), 6))
-        storage_sheet.cell(row=block + 2, column=3, value=round(float(discharge_blocks[block]), 6))
+        storage_sheet.cell(
+            row=block + 2, column=2, value=round(float(charge_blocks[block]), 6)
+        )
+        storage_sheet.cell(
+            row=block + 2, column=3, value=round(float(discharge_blocks[block]), 6)
+        )
 
     storage_sheet["E2"] = round(float(soc[0]), 6)
     storage_sheet["E3"] = round(float(soc[-1]), 6)
@@ -327,16 +342,12 @@ def print_summary(df: pd.DataFrame, solution: dict[str, np.ndarray | float]) -> 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="求解C题问题1并填充result1模板")
-    parser.add_argument(
-        "--data", type=Path, default=ATTACHMENT_DIR / "附件1.xlsx"
-    )
-    parser.add_argument(
-        "--template", type=Path, default=TEMPLATE_DIR / "result1.xlsx"
-    )
+    parser.add_argument("--data", type=Path, default=ATTACHMENT_DIR / "附件1.xlsx")
+    parser.add_argument("--template", type=Path, default=TEMPLATE_DIR / "result1.xlsx")
     parser.add_argument(
         "--output",
         type=Path,
-        default=SCRIPT_DIR / "result1_问题1求解结果.xlsx",
+        default=RESULT_DIR / "result1.xlsx",
     )
     return parser.parse_args()
 

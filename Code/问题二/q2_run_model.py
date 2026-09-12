@@ -1,15 +1,15 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """问题2主脚本：滚动预测、风险备用、日计划优化、实际运行仿真并填充result2。
 
 依赖：
     pip install numpy pandas scipy openpyxl
 
-默认文件与脚本位于同一目录：
-    python q2_run_model_v2.py
+在 VS Code 中可直接运行。默认从仓库“附件”目录读取数据和result2模板，
+正式结果保存到“提交结果/result2.xlsx”，其余文件保存到“问题二/辅助输出”：
+    python q2_run_model.py
 
 指定路径示例：
-    python q2_run_model_v2.py \
+    python q2_run_model.py \
         --attachment1 附件1.xlsx \
         --attachment2 附件2.xlsx \
         --template result2.xlsx \
@@ -19,12 +19,12 @@
 1. 附件时间是10分钟区间的右端点；功率kW先乘1/6转为kWh。
 2. 每天0:00只使用前一日及以前的实际数据预测当天，不使用未来实际值。
 3. 计划购电按计划量收费；当天实际值只用于顺序运行仿真和紧急购电。
-4. 新版负载预测采用上周同日；光伏保留历史集成。残差仅在当日结束后加入历史。
-7. 新版48小时优化、只执行前24小时；无每天6000目标。窗口末仅赋保守残值。
-8. --variant baseline/forecast_only/soc_only/revised支持逐项对照；1月统一旧策略预热。
-9. 备用是有缺口记录的经验启发式，不是95%可靠性证明，不宣称CVaR或10分钟MPC。
-5. 优化使用MILP；储能按10分钟决策，result2中再汇总为4小时结果。
-6. 内部始终使用自然日顺序，写入模板时才旋转为[第2点,...,第144点,第1点]。
+4. 负载预测采用上周同日；光伏保留历史集成。残差仅在当日结束后加入历史。
+5. 使用48小时MILP优化，只执行前24小时；窗口末使用保守残值。
+6. 储能按10分钟决策，result2中汇总为4小时结果。
+7. 内部使用自然日顺序，写入模板时按模板列顺序循环移位。
+8. --variant支持四种方案对照；1月统一使用旧策略预热。
+9. 备用是记录缺口的经验启发式，不宣称CVaR或10分钟MPC。
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ import json
 import math
 import re
 import shutil
+import sys
 import warnings
 from copy import copy
 from dataclasses import asdict, dataclass
@@ -47,6 +48,18 @@ from openpyxl.styles import PatternFill
 from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.sparse import lil_matrix
 
+
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
+ATTACHMENT_DIR = PROJECT_ROOT / "附件"
+TEMPLATE_DIR = ATTACHMENT_DIR / "附件5"
+RESULT_DIR = PROJECT_ROOT / "提交结果"
+AUXILIARY_DIR = SCRIPT_DIR / "辅助输出"
 
 DT_HOURS = 1.0 / 6.0
 T = 144
@@ -136,7 +149,9 @@ def _to_numeric_matrix(frame: pd.DataFrame, label: str) -> np.ndarray:
     numeric = frame.apply(pd.to_numeric, errors="coerce")
     missing = int(numeric.isna().sum().sum())
     if missing:
-        raise ValueError(f"{label}存在{missing}个缺失或非数值单元格；主模型不自动插值。")
+        raise ValueError(
+            f"{label}存在{missing}个缺失或非数值单元格；主模型不自动插值。"
+        )
     values = numeric.to_numpy(dtype=float)
     if np.any(values < 0):
         raise ValueError(f"{label}存在负值。")
@@ -152,11 +167,15 @@ def read_attachment1(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     frame = frame[required].copy()
     frame["右端点分钟"] = frame["时间"].map(parse_right_endpoint)
     frame = frame.sort_values("右端点分钟").reset_index(drop=True)
-    if len(frame) != T or not np.array_equal(frame["右端点分钟"].to_numpy(), EXPECTED_MINUTES):
+    if len(frame) != T or not np.array_equal(
+        frame["右端点分钟"].to_numpy(), EXPECTED_MINUTES
+    ):
         raise ValueError("附件1必须包含按右端点排列的144个10分钟时段。")
     price = pd.to_numeric(frame["电价"], errors="raise").to_numpy(dtype=float)
     prior_load = pd.to_numeric(frame["小区负载"], errors="raise").to_numpy(dtype=float)
-    prior_pv = pd.to_numeric(frame["光伏发电预测功率"], errors="raise").to_numpy(dtype=float)
+    prior_pv = pd.to_numeric(frame["光伏发电预测功率"], errors="raise").to_numpy(
+        dtype=float
+    )
     if np.any(price < 0) or np.any(prior_load < 0) or np.any(prior_pv < 0):
         raise ValueError("附件1存在负价格或负功率。")
     return price, prior_load, prior_pv
@@ -165,7 +184,9 @@ def read_attachment1(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 def read_attachment2(path: Path) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
     workbook = pd.ExcelFile(path, engine="openpyxl")
     required_sheets = ["小区负载", "光伏发电实际功率"]
-    missing_sheets = [sheet for sheet in required_sheets if sheet not in workbook.sheet_names]
+    missing_sheets = [
+        sheet for sheet in required_sheets if sheet not in workbook.sheet_names
+    ]
     if missing_sheets:
         raise KeyError(f"附件2缺少工作表：{missing_sheets}")
     load_wide = pd.read_excel(workbook, sheet_name="小区负载")
@@ -182,8 +203,12 @@ def read_attachment2(path: Path) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarr
         raise ValueError("附件2两个工作表的日期不一致。")
     if dates_load.has_duplicates:
         raise ValueError("附件2日期存在重复。")
-    load_minutes = np.array([parse_right_endpoint(x) for x in load_wide.columns[1:]], dtype=int)
-    pv_minutes = np.array([parse_right_endpoint(x) for x in pv_wide.columns[1:]], dtype=int)
+    load_minutes = np.array(
+        [parse_right_endpoint(x) for x in load_wide.columns[1:]], dtype=int
+    )
+    pv_minutes = np.array(
+        [parse_right_endpoint(x) for x in pv_wide.columns[1:]], dtype=int
+    )
     if not np.array_equal(load_minutes, pv_minutes):
         raise ValueError("附件2两个工作表的时间列不一致。")
     order = np.argsort(load_minutes)
@@ -211,10 +236,11 @@ def _candidate_for_day(
     if name == "近7天中位数":
         if day_index < 1:
             return None
-        return np.median(values[max(0, day_index - 7):day_index], axis=0)
+        return np.median(values[max(0, day_index - 7) : day_index], axis=0)
     if name == "同星期中位数":
         history_indices = [
-            j for j in range(day_index)
+            j
+            for j in range(day_index)
             if dates[j].dayofweek == dates[day_index].dayofweek
         ][-8:]
         if not history_indices:
@@ -249,7 +275,9 @@ def adaptive_historical_forecast(
                 values, dates, historical_day, name, prior_profile
             )
             if candidate is not None:
-                errors.append(float(np.mean(np.abs(values[historical_day] - candidate))))
+                errors.append(
+                    float(np.mean(np.abs(values[historical_day] - candidate)))
+                )
         if errors:
             scores[name] = 1.0 / max(float(np.mean(errors)), 1.0e-6)
         else:
@@ -280,26 +308,30 @@ def legacy_build_risk_profiles(
         base = 0.05 * forecast_load_kwh + 0.08 * forecast_pv_kwh
         plan_margin = _smooth_nonnegative(base)
         up_instant = _smooth_nonnegative(0.50 * base)
-        down_instant = _smooth_nonnegative(0.50 * base) if config.use_down_reserve else np.zeros(T)
+        down_instant = (
+            _smooth_nonnegative(0.50 * base) if config.use_down_reserve else np.zeros(T)
+        )
         scale = math.sqrt(config.reserve_horizon_intervals)
         up_cumulative = _smooth_nonnegative(up_instant * scale)
         down_cumulative = _smooth_nonnegative(down_instant * scale)
     else:
         errors = np.asarray(
-            residual_history_kwh[-config.residual_lookback_days:], dtype=float
+            residual_history_kwh[-config.residual_lookback_days :], dtype=float
         )
         q_plan = np.quantile(errors, config.plan_quantile, axis=0)
         q_reserve = np.quantile(errors, config.reserve_quantile, axis=0)
         q_down = np.quantile(-errors, config.reserve_quantile, axis=0)
         plan_margin = _smooth_nonnegative(q_plan)
         up_instant = _smooth_nonnegative(q_reserve - np.maximum(q_plan, 0.0))
-        down_instant = _smooth_nonnegative(q_down) if config.use_down_reserve else np.zeros(T)
+        down_instant = (
+            _smooth_nonnegative(q_down) if config.use_down_reserve else np.zeros(T)
+        )
 
         up_cumulative = np.zeros(T)
         down_cumulative = np.zeros(T)
         horizon = config.reserve_horizon_intervals
         for t in range(T):
-            block = errors[:, t:min(T, t + horizon)]
+            block = errors[:, t : min(T, t + horizon)]
             up_paths = np.maximum(np.cumsum(block, axis=1), 0.0).max(axis=1)
             q_plan_path = float(np.quantile(up_paths, config.plan_quantile))
             q_reserve_path = float(np.quantile(up_paths, config.reserve_quantile))
@@ -347,25 +379,25 @@ def legacy_solve_day_ahead_milp(
     n_vars = dev_neg + 1
 
     objective = np.zeros(n_vars)
-    objective[offsets["q"]:offsets["q"] + T] = price
-    objective[offsets["c"]:offsets["c"] + T] = config.degradation_cost_per_kwh
-    objective[offsets["d"]:offsets["d"] + T] = config.degradation_cost_per_kwh
-    objective[offsets["w"]:offsets["w"] + T] = config.total_spill_penalty
-    objective[offsets["su"]:offsets["su"] + T] = config.reserve_shortfall_penalty
-    objective[offsets["sd"]:offsets["sd"] + T] = config.reserve_shortfall_penalty
+    objective[offsets["q"] : offsets["q"] + T] = price
+    objective[offsets["c"] : offsets["c"] + T] = config.degradation_cost_per_kwh
+    objective[offsets["d"] : offsets["d"] + T] = config.degradation_cost_per_kwh
+    objective[offsets["w"] : offsets["w"] + T] = config.total_spill_penalty
+    objective[offsets["su"] : offsets["su"] + T] = config.reserve_shortfall_penalty
+    objective[offsets["sd"] : offsets["sd"] + T] = config.reserve_shortfall_penalty
     objective[dev_pos] = config.terminal_soc_penalty
     objective[dev_neg] = config.terminal_soc_penalty
 
     lower = np.zeros(n_vars)
     upper = np.full(n_vars, np.inf)
-    upper[offsets["c"]:offsets["c"] + T] = STEP_MAX_KWH
-    upper[offsets["d"]:offsets["d"] + T] = STEP_MAX_KWH
-    lower[offsets["e"]:offsets["e"] + T] = E_MIN
-    upper[offsets["e"]:offsets["e"] + T] = E_MAX
-    upper[offsets["z"]:offsets["z"] + T] = 1.0
+    upper[offsets["c"] : offsets["c"] + T] = STEP_MAX_KWH
+    upper[offsets["d"] : offsets["d"] + T] = STEP_MAX_KWH
+    lower[offsets["e"] : offsets["e"] + T] = E_MIN
+    upper[offsets["e"] : offsets["e"] + T] = E_MAX
+    upper[offsets["z"] : offsets["z"] + T] = 1.0
 
     integrality = np.zeros(n_vars, dtype=int)
-    integrality[offsets["z"]:offsets["z"] + T] = 1
+    integrality[offsets["z"] : offsets["z"] + T] = 1
 
     # 144条计划平衡 + 144条SOC递推 + 1条终端偏差定义。
     a_eq = lil_matrix((2 * T + 1, n_vars), dtype=float)
@@ -432,11 +464,13 @@ def legacy_solve_day_ahead_milp(
         options={"mip_rel_gap": config.mip_relative_gap, "presolve": True},
     )
     if not result.success or result.x is None:
-        raise RuntimeError(f"日计划MILP求解失败：status={result.status}, message={result.message}")
+        raise RuntimeError(
+            f"日计划MILP求解失败：status={result.status}, message={result.message}"
+        )
 
     values = result.x
     output: dict[str, np.ndarray | float | str] = {
-        name: values[offsets[name]:offsets[name] + T].copy() for name in groups
+        name: values[offsets[name] : offsets[name] + T].copy() for name in groups
     }
     output["objective"] = float(result.fun)
     output["solver_message"] = str(result.message)
@@ -547,7 +581,7 @@ def aggregate_emergency_events(
                 {
                     "日期": date,
                     "购电时间段": f"{format_minute(start * 10)}-{format_minute((end + 1) * 10)}",
-                    "购电量": float(values[start:end + 1].sum()),
+                    "购电量": float(values[start : end + 1].sum()),
                 }
             )
             found = True
@@ -555,21 +589,6 @@ def aggregate_emergency_events(
         if not found:
             rows.append({"日期": date, "购电时间段": None, "购电量": None})
     return pd.DataFrame(rows)
-
-
-def copy_row_style(source_ws, target_ws, source_row: int, target_row: int) -> None:
-    for column in range(1, source_ws.max_column + 1):
-        source = source_ws.cell(source_row, column)
-        target = target_ws.cell(target_row, column)
-        if source.has_style:
-            target._style = copy(source._style)
-        if source.number_format:
-            target.number_format = source.number_format
-        target.font = copy(source.font)
-        target.fill = copy(source.fill)
-        target.border = copy(source.border)
-        target.alignment = copy(source.alignment)
-        target.protection = copy(source.protection)
 
 
 def _clear_existing_data(ws) -> None:
@@ -589,13 +608,15 @@ def write_result2(
     actual_soc_matrix: np.ndarray,
     emergency_events: pd.DataFrame,
 ) -> None:
-    """保留模板工作表名称和主要样式，替换示例/省略号并填入完整结果。"""
+    """保留模板结构和样式，替换示例数据并填入完整结果。"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(template_path, output_path)
     workbook = load_workbook(output_path)
     required = ["计划购电量", "充放电量", "紧急购电量"]
-    missing = [sheet for sheet in required if sheet not in workbook.sheetnames]
-    if missing:
-        raise KeyError(f"result2模板缺少工作表：{missing}")
+    if workbook.sheetnames != required:
+        raise ValueError(
+            f"result2模板工作表应为{required}，实际为{workbook.sheetnames}"
+        )
 
     # 计划购电量工作表
     ws_plan = workbook["计划购电量"]
@@ -607,84 +628,105 @@ def write_result2(
         raise ValueError("result2计划购电量工作表缺少合计列。") from exc
     interval_cols = list(range(2, total_col))
     if len(interval_cols) != T:
-        raise ValueError(f"result2计划购电量工作表应有144个时段列，实际{len(interval_cols)}个。")
+        raise ValueError(
+            f"result2计划购电量工作表应有144个时段列，实际{len(interval_cols)}个。"
+        )
     # 原模板存在7:0和最后一列0:00-0:10+1的省略写法，保留原文字；
     # 按前文约定最后列填本日第1点，只是展示旋转，绝非读取明天实际值。
-    canonical_headers = [str(headers[c-1]).replace("7:0-", "7:00-") for c in interval_cols]
+    canonical_headers = [
+        str(headers[c - 1]).replace("7:0-", "7:00-") for c in interval_cols
+    ]
     if canonical_headers[-1] == "0:00-0:10+1":
         canonical_headers[-1] = "0:00+1-0:10+1"
-    if canonical_headers != [natural_interval_label(i) for i in range(1,T+1)]:
+    if canonical_headers != [natural_interval_label(i) for i in range(1, T + 1)]:
         raise ValueError("result2时段表头与已约定的循环映射不符，禁止直接按列错填。")
-    plan_style_source = 2 if ws_plan.max_row >= 2 else 1
-    plan_styles = [
-        copy(ws_plan.cell(plan_style_source, c)._style)
-        for c in range(1, ws_plan.max_column + 1)
-    ]
-    _clear_existing_data(ws_plan)
-    for day_index, date in enumerate(output_dates):
+    if ws_plan.max_row != len(output_dates) + 1:
+        raise ValueError("result2计划购电量工作表日期行数与输出日期不一致。")
+    template_dates = pd.DatetimeIndex(
+        [
+            pd.Timestamp(ws_plan.cell(row, 1).value)
+            for row in range(2, ws_plan.max_row + 1)
+        ]
+    ).normalize()
+    if not template_dates.equals(output_dates):
+        raise ValueError("result2计划购电量工作表日期与输出日期不一致。")
+    for day_index in range(len(output_dates)):
         row = day_index + 2
-        for column in range(1, ws_plan.max_column + 1):
-            ws_plan.cell(row, column)._style = copy(plan_styles[column - 1])
-        ws_plan.cell(row, 1, date.to_pydatetime())
-        ws_plan.cell(row, 1).number_format = "yyyy-mm-dd"
         natural = plan_q_matrix[day_index]
         rotated = np.r_[natural[1:], natural[:1]]
         for col, value in zip(interval_cols, rotated):
             ws_plan.cell(row, col, float(max(0.0, value)))
-            ws_plan.cell(row, col).number_format = "0.000"
         ws_plan.cell(row, total_col, float(natural.sum()))
         ws_plan.cell(row, cost_col, float(np.dot(price, natural)))
-        ws_plan.cell(row, total_col).number_format = "0.000"
-        ws_plan.cell(row, cost_col).number_format = "0.00"
-    ws_plan.freeze_panes = "B2"
 
     # 充放电量工作表：每个日期固定6行。
     ws_storage = workbook["充放电量"]
-    storage_style_source = 2 if ws_storage.max_row >= 2 else 1
-    source_styles = [copy(ws_storage.cell(storage_style_source, c)._style) for c in range(1, 7)]
+    storage_styles = [
+        [copy(ws_storage.cell(2 + block, column)._style) for column in range(1, 7)]
+        for block in range(6)
+    ]
     _clear_existing_data(ws_storage)
     target_row = 2
     for day_index, date in enumerate(output_dates):
         for block_index, block_label in enumerate(FOUR_HOUR_BLOCKS):
             for column in range(1, 7):
-                ws_storage.cell(target_row, column)._style = copy(source_styles[column - 1])
+                ws_storage.cell(target_row, column)._style = copy(
+                    storage_styles[block_index][column - 1]
+                )
             start, end = block_index * 24, (block_index + 1) * 24
-            ws_storage.cell(target_row, 1, date.to_pydatetime() if block_index == 0 else None)
-            if block_index == 0:
-                ws_storage.cell(target_row, 1).number_format = "yyyy-mm-dd"
+            ws_storage.cell(
+                target_row, 1, date.to_pydatetime() if block_index == 0 else None
+            )
             ws_storage.cell(target_row, 2, block_label)
-            ws_storage.cell(target_row, 3, float(actual_charge_matrix[day_index, start:end].sum()))
-            ws_storage.cell(target_row, 4, float(actual_discharge_matrix[day_index, start:end].sum()))
+            ws_storage.cell(
+                target_row, 3, float(actual_charge_matrix[day_index, start:end].sum())
+            )
+            ws_storage.cell(
+                target_row,
+                4,
+                float(actual_discharge_matrix[day_index, start:end].sum()),
+            )
             if block_index == 0:
                 ws_storage.cell(target_row, 5, "0:00")
                 ws_storage.cell(target_row, 6, float(start_soc_matrix[day_index, 0]))
             elif block_index == 1:
                 ws_storage.cell(target_row, 5, "24:00")
                 ws_storage.cell(target_row, 6, float(actual_soc_matrix[day_index, -1]))
-            for column in (3, 4, 6):
-                ws_storage.cell(target_row, column).number_format = "0.000"
             target_row += 1
-    ws_storage.freeze_panes = "A2"
 
     # 紧急购电量工作表：有事件则逐事件列出，无事件仍保留该日期一行。
     ws_emergency = workbook["紧急购电量"]
-    emergency_style_source = 2 if ws_emergency.max_row >= 2 else 1
-    emergency_styles = [copy(ws_emergency.cell(emergency_style_source, c)._style) for c in range(1, 4)]
+    emergency_styles = [
+        [copy(ws_emergency.cell(row, column)._style) for column in range(1, 4)]
+        for row in (2, 3, 4)
+    ]
+    emergency_date_format = ws_emergency.cell(2, 1).number_format
     _clear_existing_data(ws_emergency)
     target_row = 2
     for date, group in emergency_events.groupby("日期", sort=True):
-        for item_index, (_, item) in enumerate(group.iterrows()):
+        items = list(group.iterrows())
+        for item_index, (_, item) in enumerate(items):
+            if len(items) == 1 or item_index == len(items) - 1:
+                style_index = 2
+            elif item_index == 0:
+                style_index = 0
+            else:
+                style_index = 1
             for column in range(1, 4):
-                ws_emergency.cell(target_row, column)._style = copy(emergency_styles[column - 1])
-            ws_emergency.cell(target_row, 1, pd.Timestamp(date).to_pydatetime() if item_index == 0 else None)
+                ws_emergency.cell(target_row, column)._style = copy(
+                    emergency_styles[style_index][column - 1]
+                )
+            ws_emergency.cell(
+                target_row,
+                1,
+                pd.Timestamp(date).to_pydatetime() if item_index == 0 else None,
+            )
             if item_index == 0:
-                ws_emergency.cell(target_row, 1).number_format = "yyyy-mm-dd"
+                ws_emergency.cell(target_row, 1).number_format = emergency_date_format
             ws_emergency.cell(target_row, 2, item["购电时间段"])
             amount = item["购电量"]
             ws_emergency.cell(target_row, 3, None if pd.isna(amount) else float(amount))
-            ws_emergency.cell(target_row, 3).number_format = "0.000"
             target_row += 1
-    ws_emergency.freeze_panes = "A2"
 
     # 删除可能残留的省略号颜色，并确保工作表仍按模板顺序排列。
     for ws in (ws_storage, ws_emergency):
@@ -697,20 +739,21 @@ def write_result2(
     workbook.save(output_path)
 
 
-
 def seasonal_load_forecast(values, day_index, prior_profile, lead=0):
     """上周同日同一10分钟时段。lead=1为在今日0:00预测明天。"""
     source = day_index + lead - 7
     if 0 <= source < day_index:
         return values[source].copy(), {"上周同日": 1.0}
     if day_index:
-        return np.median(values[max(0, day_index - 7):day_index], axis=0), {"历史中位数回退": 1.0}
+        return np.median(values[max(0, day_index - 7) : day_index], axis=0), {
+            "历史中位数回退": 1.0
+        }
     return prior_profile.copy(), {"附件1先验": 1.0}
 
 
 def revised_risk_profiles(history, forecast_load, forecast_pv, config):
     """先扣实际加购增量，再计算剩余误差的前缀累计分位数。
-    
+
     不平滑、不做50%/35%截断；不可提供的备用由MILP软缺口显式记录。
     相邻历史日配对用于跨午夜4h风险；不使用当前日真实数据。
     分位数只是经验风险度量，不承诺整日可靠率。
@@ -721,7 +764,7 @@ def revised_risk_profiles(history, forecast_load, forecast_pv, config):
         errors = np.stack([-2 * scale, -scale, np.zeros(T), scale, 2 * scale])
         blocks = np.concatenate([errors, errors], axis=1)
     else:
-        errors = np.asarray(history[-config.residual_lookback_days:], dtype=float)
+        errors = np.asarray(history[-config.residual_lookback_days :], dtype=float)
         blocks = np.concatenate([errors[:-1], errors[1:]], axis=1)
     margin = np.maximum(0.0, np.quantile(errors, config.plan_quantile, axis=0))
     remaining = errors - margin
@@ -731,26 +774,34 @@ def revised_risk_profiles(history, forecast_load, forecast_pv, config):
     up_energy, down_energy = np.zeros(T), np.zeros(T)
     for t in range(T):
         prefix = np.cumsum(
-            remaining_blocks[:, t:t + config.reserve_horizon_intervals], axis=1
+            remaining_blocks[:, t : t + config.reserve_horizon_intervals], axis=1
         )
         # max(0, max_h sum residual)；捕获先缺电、后补电的路径。
-        up_energy[t] = np.quantile(np.maximum(0, prefix.max(axis=1)), config.reserve_quantile)
-        down_energy[t] = np.quantile(np.maximum(0, (-prefix).max(axis=1)), config.reserve_quantile)
+        up_energy[t] = np.quantile(
+            np.maximum(0, prefix.max(axis=1)), config.reserve_quantile
+        )
+        down_energy[t] = np.quantile(
+            np.maximum(0, (-prefix).max(axis=1)), config.reserve_quantile
+        )
     if not config.use_down_reserve:
         down[:] = 0.0
         down_energy[:] = 0.0
     return {
-        "plan_margin": margin, "up_instant": up, "down_instant": down,
-        "up_cumulative": up_energy, "down_cumulative": down_energy,
+        "plan_margin": margin,
+        "up_instant": up,
+        "down_instant": down,
+        "up_cumulative": up_energy,
+        "down_cumulative": down_energy,
         "interval_lower": np.quantile(errors, 1 - config.reserve_quantile, axis=0),
         "interval_upper": np.quantile(errors, config.reserve_quantile, axis=0),
     }
 
 
-def solve_two_day_milp(price, load, pv, next_load, next_pv, start_soc, risk, config,
-                       revised_reserve=True):
+def solve_two_day_milp(
+    price, load, pv, next_load, next_pv, start_soc, risk, config, revised_reserve=True
+):
     """48h窗口MILP，只返回首日计划。第二日为展望，不是提前锁定的购电。
-    
+
     E_t=E_(t-1)+0.9*c_t-d_t/0.9；1200<=E_t<=10800。
     没有每日6000回归约束/罚金；48h末只使用保守电量残值。
     备用作用于开始SOC，并对计划后的SOC也设保护，避免计划本身耗掉备用；
@@ -768,83 +819,95 @@ def solve_two_day_milp(price, load, pv, next_load, next_pv, start_soc, risk, con
     ed = np.tile(risk["down_cumulative"], 2) * ETA_C
     net = np.r_[load - pv, next_load - next_pv] + margin
     obj = np.zeros(nv)
-    obj[offsets["q"]:offsets["q"] + n] = prices
+    obj[offsets["q"] : offsets["q"] + n] = prices
     for name in ["c", "d"]:
-        obj[offsets[name]:offsets[name] + n] = config.degradation_cost_per_kwh
-    obj[offsets["w"]:offsets["w"] + n] = config.total_spill_penalty
-    obj[offsets["su"]:offsets["su"] + n] = config.reserve_shortfall_penalty * (ETA_D if revised_reserve else 1.0)
-    obj[offsets["sd"]:offsets["sd"] + n] = (
-        config.down_reserve_penalty / ETA_C if revised_reserve else config.reserve_shortfall_penalty
+        obj[offsets[name] : offsets[name] + n] = config.degradation_cost_per_kwh
+    obj[offsets["w"] : offsets["w"] + n] = config.total_spill_penalty
+    obj[offsets["su"] : offsets["su"] + n] = config.reserve_shortfall_penalty * (
+        ETA_D if revised_reserve else 1.0
     )
-    obj[offsets["pu"]:offsets["pu"] + n] = config.reserve_shortfall_penalty
-    obj[offsets["pd"]:offsets["pd"] + n] = config.down_reserve_penalty
+    obj[offsets["sd"] : offsets["sd"] + n] = (
+        config.down_reserve_penalty / ETA_C
+        if revised_reserve
+        else config.reserve_shortfall_penalty
+    )
+    obj[offsets["pu"] : offsets["pu"] + n] = config.reserve_shortfall_penalty
+    obj[offsets["pd"] : offsets["pd"] + n] = config.down_reserve_penalty
     # 仅代表优化窗口以外的保守留电价值；不计入真实账单，也不是卖电。
     salvage = config.terminal_value_factor * ETA_D * float(price.min())
     obj[offsets["e"] + n - 1] -= salvage
     lower, upper = np.zeros(nv), np.full(nv, np.inf)
     for name in ["c", "d"]:
-        upper[offsets[name]:offsets[name] + n] = STEP_MAX_KWH
-    lower[offsets["e"]:offsets["e"] + n] = E_MIN
-    upper[offsets["e"]:offsets["e"] + n] = E_MAX
-    upper[offsets["z"]:offsets["z"] + n] = 1
+        upper[offsets[name] : offsets[name] + n] = STEP_MAX_KWH
+    lower[offsets["e"] : offsets["e"] + n] = E_MIN
+    upper[offsets["e"] : offsets["e"] + n] = E_MAX
+    upper[offsets["z"] : offsets["z"] + n] = 1
     integer = np.zeros(nv, dtype=int)
-    integer[offsets["z"]:offsets["z"] + n] = 1
-    aeq, beq = lil_matrix((2*n, nv)), np.zeros(2*n)
+    integer[offsets["z"] : offsets["z"] + n] = 1
+    aeq, beq = lil_matrix((2 * n, nv)), np.zeros(2 * n)
     for t in range(n):
         for name, coef in [("q", 1), ("c", -1), ("d", 1), ("w", -1)]:
-            aeq[t, offsets[name]+t] = coef
+            aeq[t, offsets[name] + t] = coef
         beq[t] = net[t]
-        aeq[n+t, offsets["e"]+t] = 1
-        aeq[n+t, offsets["c"]+t] = -ETA_C
-        aeq[n+t, offsets["d"]+t] = 1/ETA_D
+        aeq[n + t, offsets["e"] + t] = 1
+        aeq[n + t, offsets["c"] + t] = -ETA_C
+        aeq[n + t, offsets["d"] + t] = 1 / ETA_D
         if t == 0:
-            beq[n+t] = start_soc
+            beq[n + t] = start_soc
         else:
-            aeq[n+t, offsets["e"]+t-1] = -1
+            aeq[n + t, offsets["e"] + t - 1] = -1
     rows, rhs = [], []
+
     def add(coeffs, limit):
         rows.append(coeffs)
         rhs.append(limit)
+
     for t in range(n):
-        ix = lambda name: offsets[name]+t
+        ix = lambda name: offsets[name] + t
         if revised_reserve:
             # 模式约束与物理功率上限为硬约束，备用单独允许软缺口。
             add({ix("c"): 1, ix("z"): -STEP_MAX_KWH}, 0)
             add({ix("d"): 1, ix("z"): STEP_MAX_KWH}, STEP_MAX_KWH)
-            add({ix("d"): 1, ix("pu"): -1}, STEP_MAX_KWH-ru[t])
-            add({ix("c"): 1, ix("pd"): -1}, STEP_MAX_KWH-rd[t])
+            add({ix("d"): 1, ix("pu"): -1}, STEP_MAX_KWH - ru[t])
+            add({ix("c"): 1, ix("pd"): -1}, STEP_MAX_KWH - rd[t])
             if t == 0:
-                add({ix("su"): -1}, start_soc-E_MIN-eu[t])
-                add({ix("sd"): -1}, E_MAX-ed[t]-start_soc)
+                add({ix("su"): -1}, start_soc - E_MIN - eu[t])
+                add({ix("sd"): -1}, E_MAX - ed[t] - start_soc)
             else:
-                add({offsets["e"]+t-1: -1, ix("su"): -1}, -E_MIN-eu[t])
-                add({offsets["e"]+t-1: 1, ix("sd"): -1}, E_MAX-ed[t])
+                add({offsets["e"] + t - 1: -1, ix("su"): -1}, -E_MIN - eu[t])
+                add({offsets["e"] + t - 1: 1, ix("sd"): -1}, E_MAX - ed[t])
             # 保护计划动作后的库存；不是替代开始时点检查。
-            add({ix("e"): -1, ix("su"): -1}, -E_MIN-eu[t])
-            add({ix("e"): 1, ix("sd"): -1}, E_MAX-ed[t])
+            add({ix("e"): -1, ix("su"): -1}, -E_MIN - eu[t])
+            add({ix("e"): 1, ix("sd"): -1}, E_MAX - ed[t])
         else:
             # soc_only消融：保留原风险公式、截断与结束SOC口径。
-            cc, dc = max(0, STEP_MAX_KWH-rd[t]), max(0, STEP_MAX_KWH-ru[t])
+            cc, dc = max(0, STEP_MAX_KWH - rd[t]), max(0, STEP_MAX_KWH - ru[t])
             add({ix("c"): 1, ix("z"): -cc}, 0)
             add({ix("d"): 1, ix("z"): dc}, dc)
-            add({ix("e"): -1, ix("su"): -1}, -E_MIN-eu[t])
-            add({ix("e"): 1, ix("sd"): -1}, E_MAX-ed[t])
+            add({ix("e"): -1, ix("su"): -1}, -E_MIN - eu[t])
+            add({ix("e"): 1, ix("sd"): -1}, E_MAX - ed[t])
     aub = lil_matrix((len(rows), nv))
     for row, coeffs in enumerate(rows):
         for column, coef in coeffs.items():
             aub[row, column] = coef
     result = milp(
-        c=obj, integrality=integer, bounds=Bounds(lower, upper),
-        constraints=[LinearConstraint(aeq.tocsr(), beq, beq),
-                     LinearConstraint(aub.tocsr(), -np.inf, np.asarray(rhs))],
+        c=obj,
+        integrality=integer,
+        bounds=Bounds(lower, upper),
+        constraints=[
+            LinearConstraint(aeq.tocsr(), beq, beq),
+            LinearConstraint(aub.tocsr(), -np.inf, np.asarray(rhs)),
+        ],
         options={"mip_rel_gap": config.mip_relative_gap},
     )
     if not result.success or result.x is None:
         raise RuntimeError(f"48h MILP失败: {result.message}")
-    answer = {name: np.asarray(result.x[offsets[name]:offsets[name]+T]) for name in groups}
+    answer = {
+        name: np.asarray(result.x[offsets[name] : offsets[name] + T]) for name in groups
+    }
     answer["objective"] = float(result.fun)
     answer["terminal_deviation"] = 0.0  # 新版不存在6000偏差项
-    answer["window_final_soc"] = float(result.x[offsets["e"]+n-1])
+    answer["window_final_soc"] = float(result.x[offsets["e"] + n - 1])
     answer["solver_message"] = str(result.message)
     return answer
 
@@ -871,11 +934,15 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
     if config.terminal_value_factor < 0 or config.down_reserve_penalty < 0:
         raise ValueError("残值系数与下备用罚金不得为负。")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.result.parent.mkdir(parents=True, exist_ok=True)
     price, prior_load_kw, prior_pv_kw = read_attachment1(args.attachment1)
     dates, load_kw, pv_kw = read_attachment2(args.attachment2)
     if not dates.equals(pd.date_range("2025-01-01", "2025-12-31", freq="D")):
         raise ValueError("需要完整、有序且无重复的2025年365天数据；禁止静默跳日。")
-    if not all(np.isfinite(v).all() for v in [price, prior_load_kw, prior_pv_kw, load_kw, pv_kw]):
+    if not all(
+        np.isfinite(v).all()
+        for v in [price, prior_load_kw, prior_pv_kw, load_kw, pv_kw]
+    ):
         raise ValueError("输入存在NaN或无穷值。")
     if dates.min() != pd.Timestamp("2025-01-01") or dates.max() != OUTPUT_END:
         warnings.warn("附件2日期范围不是完整的2025年；请核对输出日期。", RuntimeWarning)
@@ -887,13 +954,34 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
     arrays = {
         name: np.zeros(shape, dtype=float)
         for name in [
-            "forecast_load_kw", "forecast_pv_kw", "forecast_load_kwh", "forecast_pv_kwh",
-            "plan_margin", "up_instant", "down_instant", "up_cumulative", "down_cumulative",
-            "plan_q", "plan_c", "plan_d", "plan_soc", "plan_spill",
-            "reserve_shortfall_up", "reserve_shortfall_down",
-            "actual_start_soc", "actual_c", "actual_d", "actual_soc", "emergency",
-            "spill", "pv_curtail", "grid_unused", "interval_lower", "interval_upper",
-            "power_shortfall_up", "power_shortfall_down",
+            "forecast_load_kw",
+            "forecast_pv_kw",
+            "forecast_load_kwh",
+            "forecast_pv_kwh",
+            "plan_margin",
+            "up_instant",
+            "down_instant",
+            "up_cumulative",
+            "down_cumulative",
+            "plan_q",
+            "plan_c",
+            "plan_d",
+            "plan_soc",
+            "plan_spill",
+            "reserve_shortfall_up",
+            "reserve_shortfall_down",
+            "actual_start_soc",
+            "actual_c",
+            "actual_d",
+            "actual_soc",
+            "emergency",
+            "spill",
+            "pv_curtail",
+            "grid_unused",
+            "interval_lower",
+            "interval_upper",
+            "power_shortfall_up",
+            "power_shortfall_down",
         ]
     }
     objectives = np.zeros(n_days)
@@ -929,7 +1017,9 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
             for h in range(day_index):
                 old_load, _ = seasonal_load_forecast(load_kw, h, prior_load_kw)
                 old_pv, _ = adaptive_historical_forecast(pv_kw, dates, h, prior_pv_kw)
-                residual_history.append((load_kw[h] - old_load - pv_kw[h] + old_pv) * DT_HOURS)
+                residual_history.append(
+                    (load_kw[h] - old_load - pv_kw[h] + old_pv) * DT_HOURS
+                )
         if variant == "revised":
             risk = revised_risk_profiles(
                 residual_history, forecast_load_kwh, forecast_pv_kwh, config
@@ -941,14 +1031,22 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
         if variant in {"soc_only", "revised"}:
             # 第二天只用此刻已知历史预测；绝不访问day_index当天或未来实际值。
             if variant == "revised":
-                next_load_kw, _ = seasonal_load_forecast(load_kw, day_index, prior_load_kw, lead=1)
+                next_load_kw, _ = seasonal_load_forecast(
+                    load_kw, day_index, prior_load_kw, lead=1
+                )
             else:
                 next_load_kw = forecast_load_kw.copy()  # SOC单独消融只改变优化窗
             next_pv_kw = forecast_pv_kw.copy()  # 48h第二天PV延续当次预测，显式近似
             plan = solve_two_day_milp(
-                price, forecast_load_kwh, forecast_pv_kwh,
-                next_load_kw * DT_HOURS, next_pv_kw * DT_HOURS,
-                current_soc, risk, config, revised_reserve=(variant == "revised")
+                price,
+                forecast_load_kwh,
+                forecast_pv_kwh,
+                next_load_kw * DT_HOURS,
+                next_pv_kw * DT_HOURS,
+                current_soc,
+                risk,
+                config,
+                revised_reserve=(variant == "revised"),
             )
             window_final_soc[day_index] = plan["window_final_soc"]
         else:
@@ -977,7 +1075,13 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
         arrays["forecast_pv_kw"][day_index] = forecast_pv_kw
         arrays["forecast_load_kwh"][day_index] = forecast_load_kwh
         arrays["forecast_pv_kwh"][day_index] = forecast_pv_kwh
-        for name in ["plan_margin", "up_instant", "down_instant", "up_cumulative", "down_cumulative"]:
+        for name in [
+            "plan_margin",
+            "up_instant",
+            "down_instant",
+            "up_cumulative",
+            "down_cumulative",
+        ]:
             arrays[name][day_index] = risk[name]
         arrays["plan_q"][day_index] = np.asarray(plan["q"])
         arrays["plan_c"][day_index] = np.asarray(plan["c"])
@@ -1003,9 +1107,13 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
         )
         residual_history.append(net_residual)
         for name, weight in load_weights.items():
-            load_weight_records.append({"日期": date, "变量": "负载", "基准": name, "权重": weight})
+            load_weight_records.append(
+                {"日期": date, "变量": "负载", "基准": name, "权重": weight}
+            )
         for name, weight in pv_weights.items():
-            pv_weight_records.append({"日期": date, "变量": "光伏", "基准": name, "权重": weight})
+            pv_weight_records.append(
+                {"日期": date, "变量": "光伏", "基准": name, "权重": weight}
+            )
 
         if day_index == 0 or (day_index + 1) % 30 == 0 or day_index == n_days - 1:
             print(
@@ -1023,7 +1131,10 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
     interval_labels = [natural_interval_label(i) for i in range(T)]
     for day_index in output_indices:
         net_actual_kwh = load_kwh[day_index] - pv_kwh[day_index]
-        net_forecast_kwh = arrays["forecast_load_kwh"][day_index] - arrays["forecast_pv_kwh"][day_index]
+        net_forecast_kwh = (
+            arrays["forecast_load_kwh"][day_index]
+            - arrays["forecast_pv_kwh"][day_index]
+        )
         frame = pd.DataFrame(
             {
                 "日期": dates[day_index],
@@ -1041,8 +1152,10 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
                 "实际净负荷_kWh": net_actual_kwh,
                 "净负荷预测误差_kWh": net_actual_kwh - net_forecast_kwh,
                 "计划风险增量_kWh": arrays["plan_margin"][day_index],
-                "净负荷预测下界_kWh": net_forecast_kwh + arrays["interval_lower"][day_index],
-                "净负荷预测上界_kWh": net_forecast_kwh + arrays["interval_upper"][day_index],
+                "净负荷预测下界_kWh": net_forecast_kwh
+                + arrays["interval_lower"][day_index],
+                "净负荷预测上界_kWh": net_forecast_kwh
+                + arrays["interval_upper"][day_index],
                 "计划购电量_kWh": arrays["plan_q"][day_index],
                 "计划充电量_kWh": arrays["plan_c"][day_index],
                 "计划放电量_kWh": arrays["plan_d"][day_index],
@@ -1080,9 +1193,29 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
         daily_rows.append(
             {
                 "日期": dates[day_index],
-                "预测负载MAE_kW": float(np.mean(np.abs(load_kw[day_index] - arrays["forecast_load_kw"][day_index]))),
-                "预测光伏MAE_kW": float(np.mean(np.abs(pv_kw[day_index] - arrays["forecast_pv_kw"][day_index]))),
-                "预测净负荷MAE_kWh": float(np.mean(np.abs((load_kwh[day_index] - pv_kwh[day_index]) - (arrays["forecast_load_kwh"][day_index] - arrays["forecast_pv_kwh"][day_index])))),
+                "预测负载MAE_kW": float(
+                    np.mean(
+                        np.abs(
+                            load_kw[day_index] - arrays["forecast_load_kw"][day_index]
+                        )
+                    )
+                ),
+                "预测光伏MAE_kW": float(
+                    np.mean(
+                        np.abs(pv_kw[day_index] - arrays["forecast_pv_kw"][day_index])
+                    )
+                ),
+                "预测净负荷MAE_kWh": float(
+                    np.mean(
+                        np.abs(
+                            (load_kwh[day_index] - pv_kwh[day_index])
+                            - (
+                                arrays["forecast_load_kwh"][day_index]
+                                - arrays["forecast_pv_kwh"][day_index]
+                            )
+                        )
+                    )
+                ),
                 "计划购电量_kWh": float(arrays["plan_q"][day_index].sum()),
                 "计划购电费_元": plan_cost,
                 "紧急购电量_kWh": float(arrays["emergency"][day_index].sum()),
@@ -1093,8 +1226,12 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
                 "未利用外网电量_kWh": float(arrays["grid_unused"][day_index].sum()),
                 "期初SOC_kWh": float(arrays["actual_start_soc"][day_index, 0]),
                 "期末SOC_kWh": float(arrays["actual_soc"][day_index, -1]),
-                "正向备用缺口_kWh": float(arrays["reserve_shortfall_up"][day_index].sum()),
-                "反向备用缺口_kWh": float(arrays["reserve_shortfall_down"][day_index].sum()),
+                "正向备用缺口_kWh": float(
+                    arrays["reserve_shortfall_up"][day_index].sum()
+                ),
+                "反向备用缺口_kWh": float(
+                    arrays["reserve_shortfall_down"][day_index].sum()
+                ),
                 "优化目标值": float(objectives[day_index]),
                 "计划终端SOC偏差_kWh": float(terminal_deviation[day_index]),
                 "计划日末SOC_kWh": float(arrays["plan_soc"][day_index, -1]),
@@ -1119,7 +1256,7 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
     emergency_path = args.output_dir / "q2_emergency_events.csv"
     emergency_events.to_csv(emergency_path, index=False, encoding="utf-8-sig")
 
-    result_path = args.output_dir / "result2_filled.xlsx"
+    result_path = args.result
     write_result2(
         args.template,
         result_path,
@@ -1134,14 +1271,18 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
     )
 
     metadata = {
-        "model": config.variant + ": causal forecast + rolling 48h MILP + plan-following control (not CVaR or intraday MPC)",
+        "model": config.variant
+        + ": causal forecast + rolling 48h MILP + plan-following control (not CVaR or intraday MPC)",
         "curtailment_attribution": "优先弃光的记账假设；总剩余电量是主指标，弃光率不唯一",
         "terminal_policy": "revised/soc_only无每日6000目标；48h末残值=因子*eta_d*最低电价，非售电收入",
         "interval_definition": "revised的原始误差Q05-Q95为名义90%区间，不是95%整日可靠率",
         "next_day_approximation": "第二天负载按上周同日，PV延续当次预测，第二天备用复用首日曲线；需样本外验证",
         "config": asdict(config),
         "data_range": [str(dates.min().date()), str(dates.max().date())],
-        "output_range": [str(output_dates.min().date()), str(output_dates.max().date())],
+        "output_range": [
+            str(output_dates.min().date()),
+            str(output_dates.max().date()),
+        ],
         "right_endpoint_rule": "0:10 means 0:00-0:10",
         "template_rotation": "[point 2, ..., point 144, point 1]",
         "template_ambiguity": "原表末列写0:00-0:10+1；保留原文，按约定映射本日第1点而非翌日实际值",
@@ -1149,12 +1290,17 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
         "cost_rule": "planned purchase is billed by planned quantity; emergency price is 5x",
         "cold_start": "Attachment 1 load/PV profiles are used as prior; January is causal warm-up",
         "output_files": [
-            result_path.name, timeseries_path.name, daily_path.name,
-            weights_path.name, emergency_path.name,
+            result_path.name,
+            timeseries_path.name,
+            daily_path.name,
+            weights_path.name,
+            emergency_path.name,
         ],
     }
     metadata_path = args.output_dir / "q2_run_metadata.json"
-    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     print("\n[完成]")
     print(f"  result2：{result_path.resolve()}")
@@ -1163,7 +1309,9 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
     print(f"  计划购电费：{daily['计划购电费_元'].sum():,.2f} 元")
     print(f"  紧急购电费：{daily['紧急购电费_元'].sum():,.2f} 元")
     print(f"  紧急购电量：{daily['紧急购电量_kWh'].sum():,.2f} kWh")
-    print(f"  全期弃光率：{daily['弃光量_kWh'].sum() / (pv_kwh[output_mask].sum()):.2%}")
+    print(
+        f"  全期弃光率：{daily['弃光量_kWh'].sum() / (pv_kwh[output_mask].sum()):.2%}"
+    )
     return {
         "result2": result_path,
         "timeseries": timeseries_path,
@@ -1175,25 +1323,68 @@ def run_model(args: argparse.Namespace) -> dict[str, Path]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="问题2滚动预测、优化、实际仿真与result2填充")
-    parser.add_argument("--attachment1", type=Path, default=Path("附件1.xlsx"))
-    parser.add_argument("--attachment2", type=Path, default=Path("附件2.xlsx"))
-    parser.add_argument("--template", type=Path, default=Path("result2.xlsx"))
-    parser.add_argument("--output-dir", type=Path, default=Path("q2_output_v2"))
-    parser.add_argument("--variant", choices=["baseline", "forecast_only", "soc_only", "revised"], default="revised")
-    parser.add_argument("--terminal-value-factor", type=float, default=1.0, help="48h末电量残值因子，不是每日SOC目标")
-    parser.add_argument("--down-reserve-penalty", type=float, default=0.02, help="下备用软罚金，仅为抑制剩余电量的启发式")
+    parser = argparse.ArgumentParser(
+        description="问题2滚动预测、优化、实际仿真与result2填充"
+    )
+    parser.add_argument(
+        "--attachment1", type=Path, default=ATTACHMENT_DIR / "附件1.xlsx"
+    )
+    parser.add_argument(
+        "--attachment2", type=Path, default=ATTACHMENT_DIR / "附件2.xlsx"
+    )
+    parser.add_argument("--template", type=Path, default=TEMPLATE_DIR / "result2.xlsx")
+    parser.add_argument("--result", type=Path, default=RESULT_DIR / "result2.xlsx")
+    parser.add_argument("--output-dir", type=Path, default=AUXILIARY_DIR)
+    parser.add_argument(
+        "--variant",
+        choices=["baseline", "forecast_only", "soc_only", "revised"],
+        default="revised",
+    )
+    parser.add_argument(
+        "--terminal-value-factor",
+        type=float,
+        default=1.0,
+        help="48h末电量残值因子，不是每日SOC目标",
+    )
+    parser.add_argument(
+        "--down-reserve-penalty",
+        type=float,
+        default=0.02,
+        help="下备用软罚金，仅为抑制剩余电量的启发式",
+    )
     parser.add_argument("--plan-quantile", type=float, default=0.80)
     parser.add_argument("--reserve-quantile", type=float, default=0.95)
-    parser.add_argument("--reserve-horizon", type=int, default=24, help="累计备用观察时段数，24表示4小时")
+    parser.add_argument(
+        "--reserve-horizon",
+        type=int,
+        default=24,
+        help="累计备用观察时段数，24表示4小时",
+    )
     parser.add_argument("--residual-lookback", type=int, default=56)
     parser.add_argument("--reserve-shortfall-penalty", type=float, default=4.0)
-    parser.add_argument("--terminal-soc-target", type=float, default=E_INITIAL,
-                        help="仅用于旧策略对照/1月共同预热；revised不使用每日目标")
-    parser.add_argument("--terminal-soc-penalty", type=float, default=0.65,
-                        help="仅用于旧策略对照/1月共同预热；revised不使用每日罚金")
-    parser.add_argument("--degradation-cost", type=float, default=0.0, help="有文献依据时再填写元/kWh吞吐成本")
-    parser.add_argument("--disable-down-reserve", action="store_true", help="关闭用于吸收额外光伏的反向备用")
+    parser.add_argument(
+        "--terminal-soc-target",
+        type=float,
+        default=E_INITIAL,
+        help="仅用于旧策略对照/1月共同预热；revised不使用每日目标",
+    )
+    parser.add_argument(
+        "--terminal-soc-penalty",
+        type=float,
+        default=0.65,
+        help="仅用于旧策略对照/1月共同预热；revised不使用每日罚金",
+    )
+    parser.add_argument(
+        "--degradation-cost",
+        type=float,
+        default=0.0,
+        help="有文献依据时再填写元/kWh吞吐成本",
+    )
+    parser.add_argument(
+        "--disable-down-reserve",
+        action="store_true",
+        help="关闭用于吸收额外光伏的反向备用",
+    )
     return parser.parse_args()
 
 

@@ -1,3 +1,9 @@
 __pycache__/
 *.py[cod]
+.pytest_cache/
+*.tmp
 ~$*
+
+# 运行产生的明细、图表和诊断文件
+Code/*/辅助输出/*
+!Code/*/辅助输出/.gitkeep

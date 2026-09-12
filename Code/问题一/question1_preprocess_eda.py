@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """问题1：附件1数据预处理、探索性数据分析（EDA）与空白结果表生成。
 
-在 VS Code 中可直接运行当前文件。默认读取仓库“附件”目录中的附件1.xlsx，
-并将结果保存到本脚本所在的“问题一”目录。
+在 VS Code 中可直接运行。默认读取“附件/附件1.xlsx”，
+并将清洗数据、空白表和图片保存到“问题一/辅助输出”。
 
 时间约定：附件1采用右端点记时。原始时刻 0:10 表示区间 0:00-0:10，
 原始时刻 0:00+1 表示区间 23:50-24:00。
@@ -40,6 +40,7 @@ EXPECTED_STEP_MINUTES = 10
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 ATTACHMENT_DIR = PROJECT_ROOT / "附件"
+AUXILIARY_DIR = SCRIPT_DIR / "辅助输出"
 
 REQUIRED_COLUMNS = ["时间", "电价", "小区负载", "光伏发电预测功率"]
 NUMERIC_COLUMNS = ["电价", "小区负载", "光伏发电预测功率"]
@@ -109,9 +110,7 @@ def warn_about_time_axis(minutes: pd.Series) -> list[str]:
     messages: list[str] = []
 
     if len(minutes) != EXPECTED_ROWS:
-        messages.append(
-            f"行数异常：实际 {len(minutes)} 行，预期 {EXPECTED_ROWS} 行。"
-        )
+        messages.append(f"行数异常：实际 {len(minutes)} 行，预期 {EXPECTED_ROWS} 行。")
 
     duplicate_values = minutes[minutes.duplicated(keep=False)].tolist()
     if duplicate_values:
@@ -121,7 +120,7 @@ def warn_about_time_axis(minutes: pd.Series) -> list[str]:
     bad_steps = differences[differences != EXPECTED_STEP_MINUTES]
     if not bad_steps.empty:
         detail = [
-            f"第{idx}至第{idx + 1}个排序点：{int(step)}分钟" # type: ignore
+            f"第{idx}至第{idx + 1}个排序点：{int(step)}分钟"  # type: ignore
             for idx, step in bad_steps.items()
         ]
         messages.append("发现非10分钟步长：" + "；".join(detail))
@@ -148,7 +147,9 @@ def load_and_parse_data(input_path: Path) -> tuple[pd.DataFrame, list[str]]:
 
     missing_columns = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing_columns:
-        raise KeyError(f"缺少必要列：{missing_columns}；实际列为：{df.columns.tolist()}")
+        raise KeyError(
+            f"缺少必要列：{missing_columns}；实际列为：{df.columns.tolist()}"
+        )
 
     df = df[REQUIRED_COLUMNS].copy()
     df["时间分钟"] = df["时间"].map(parse_time_to_minutes)
@@ -175,9 +176,7 @@ def clean_and_derive(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         newly_invalid = after_coercion_missing - original_missing
 
         if newly_invalid > 0:
-            report.append(
-                f"{column}：有 {newly_invalid} 个非数值内容被转换为 NaN。"
-            )
+            report.append(f"{column}：有 {newly_invalid} 个非数值内容被转换为 NaN。")
 
         if after_coercion_missing > 0:
             cleaned[column] = cleaned[column].interpolate(
@@ -264,7 +263,7 @@ def plot_net_load_regions(df: pd.DataFrame, output_path: Path) -> None:
     net_load = df["净负荷_kW"].to_numpy(dtype=float)
 
     ax.plot(x, net_load, color="#334155", lw=2.1, label="净负荷 (kW)")
-    
+
     ax.fill_between(
         x,
         0,
@@ -313,7 +312,7 @@ def build_blank_result_table(df: pd.DataFrame) -> tuple[pd.DataFrame, list[int]]
 
     source_point_order = list(range(2, EXPECTED_ROWS + 1)) + [1]
     interval_starts = np.arange(10, 1450, 10)
-    
+
     interval_labels = [
         f"{format_minute(int(start), pad_hour=False)}-{format_minute(int(start) + 10, pad_hour=False)}"
         for start in interval_starts
@@ -399,8 +398,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=SCRIPT_DIR,
-        help="输出目录（默认：脚本所在的“问题一”目录）",
+        default=AUXILIARY_DIR,
+        help="辅助输出目录（默认：问题一/辅助输出）",
     )
     return parser.parse_args()
 
