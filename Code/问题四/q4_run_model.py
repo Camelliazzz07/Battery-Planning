@@ -134,7 +134,7 @@ def rolling_forecast(
                 losses.append(_forecast_loss(values[j], pred, selection_loss))
         if losses:
             scores[name] = float(np.mean(losses))
-    selected = min(scores, key=scores.get) if scores else ("lag7" if i >= 7 else "lag1")
+    selected = min(scores, key=scores.get) if scores else ("lag7" if i >= 7 else "lag1") # type: ignore
     return current[selected].copy(), selected
 
 
@@ -383,7 +383,7 @@ def simulate_day(
                 x["margin"],
                 x["reserve"],
                 x["local_cfg"],
-                None if hour == 0 else q0[t:],
+                None if hour == 0 else q0[t:], # type: ignore
             )
             if hour == 0:
                 q0 = sol["q"].copy()
@@ -421,8 +421,8 @@ def simulate_day(
                         "objective_price": x["price"][j],
                         "margin_kwh": x["margin"][j],
                         "reserve_grid_kwh": x["reserve"][j],
-                        "q0_kwh": q0[t + j],
-                        "previous_active_kwh": old[j] if hour else q0[j],
+                        "q0_kwh": q0[t + j], # type: ignore
+                        "previous_active_kwh": old[j] if hour else q0[j], # type: ignore
                         "new_active_kwh": sol["q"][j],
                         "planned_charge_kwh": sol["c"][j],
                         "planned_discharge_kwh": sol["d"][j],
@@ -445,9 +445,9 @@ def simulate_day(
                 "end_time": str(data.dates[day_index] + pd.Timedelta(minutes=(t + 1) * 10)),
                 "interval": core.interval(t),
                 "price": prices[day_index, t],
-                "forecast_price_0": midnight_price[t],
-                "objective_price_0": midnight_objective_price[t],
-                "q0_kwh": q0[t],
+                "forecast_price_0": midnight_price[t], # type: ignore
+                "objective_price_0": midnight_objective_price[t], # type: ignore
+                "q0_kwh": q0[t], # type: ignore
                 "active_kwh": active[t],
                 "load_kwh": load,
                 "pv_kwh": pv,
@@ -621,7 +621,7 @@ def write_official_workbook(
             emergency.cell(
                 target_row,
                 1,
-                pd.Timestamp(date).to_pydatetime() if item_index == 0 else None,
+                pd.Timestamp(date).to_pydatetime() if item_index == 0 else None, # type: ignore
             )
             if item_index == 0:
                 emergency.cell(target_row, 1).number_format = emergency_date_format
