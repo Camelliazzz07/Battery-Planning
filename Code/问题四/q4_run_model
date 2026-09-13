@@ -1,0 +1,1086 @@
+"""Q4: fluctuating-price variants of Q2 and Q3.
+
+Repository entry point::
+
+    python Code/问题四/q4_run_model.py
+
+The implementation reuses the verified Q3 physical/MILP core instead of keeping a
+second frozen copy.  All internal energy variables are kWh.  Attachment 4 prices
+are used for actual settlement; the default ``causal`` information contract uses
+only prices observed before the decision time to forecast future prices.
+
+This is a causal rolling-policy backtest, not a proof of a multistage stochastic
+optimum.  Use ``--price-information known_day_ahead`` only as an explicitly
+labelled alternative interpretation of Q4.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import shutil
+import sys
+from copy import copy
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import scipy
+from openpyxl import load_workbook
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
+Q3_DIR = SCRIPT_DIR.parent / "问题三"
+if str(Q3_DIR) not in sys.path:
+    sys.path.insert(0, str(Q3_DIR))
+
+try:
+    import q3_run_model as core
+except ImportError as exc:  # pragma: no cover - explicit deployment error
+    raise ImportError(
+        "Q4 requires Code/问题三/q3_run_model.py in the same repository."
+    ) from exc
+
+ATTACHMENT_DIR = PROJECT_ROOT / "附件"
+TEMPLATE_DIR = ATTACHMENT_DIR / "附件5"
+RESULT_DIR = PROJECT_ROOT / "提交结果"
+AUXILIARY_DIR = RESULT_DIR / "问题四_辅助输出"
+
+T, DT, ISSUES = core.T, core.DT, core.ISSUES
+CANDIDATES = ("lag7", "lag1", "mean7", "mean28", "weekday4")
+
+
+@dataclass(frozen=True)
+class Q4Config:
+    validation_days: int = 28
+    price_update_weight: float = 0.5
+    price_update_decay_hours: float = 6.0
+    price_floor: float = 1e-6
+    risk_weighting: str = "price"
+    price_selection_loss: str = "mae"
+
+
+def read_prices(path: Path, dates: pd.DatetimeIndex) -> np.ndarray:
+    """Read Attachment 4 and align its 144 right-endpoint columns to Q2/Q3 dates."""
+    frame = pd.read_excel(path)
+    current = pd.DatetimeIndex(pd.to_datetime(frame.iloc[:, 0])).normalize()
+    if current.has_duplicates or not current.is_monotonic_increasing:
+        raise ValueError("附件4: dates must be unique and increasing")
+    minutes = np.array([core.endpoint_minute(c) for c in frame.columns[1:]])
+    order = np.argsort(minutes)
+    if not np.array_equal(minutes[order], np.arange(10, 1441, 10)):
+        raise ValueError("附件4: require all 144 unique right endpoints")
+    values = core.finite_nonnegative(
+        frame.iloc[:, 1:].to_numpy()[:, order], "附件4 price"
+    )
+    selected = current.get_indexer(dates)
+    if (selected < 0).any():
+        raise ValueError("附件4 does not cover every load/PV date")
+    return values[selected]
+
+
+def candidate(values: np.ndarray, i: int, name: str) -> np.ndarray | None:
+    """Past-only same-shape forecast candidate for day i."""
+    if name == "lag7":
+        return values[i - 7].copy() if i >= 7 else None
+    if name == "lag1":
+        return values[i - 1].copy() if i else None
+    if name == "mean7":
+        return values[max(0, i - 7) : i].mean(axis=0) if i else None
+    if name == "mean28":
+        return values[max(0, i - 28) : i].mean(axis=0) if i else None
+    if name == "weekday4":
+        ix = list(range(i - 7, max(-1, i - 29), -7))
+        return values[ix].mean(axis=0) if ix else None
+    raise ValueError(name)
+
+
+def _forecast_loss(actual: np.ndarray, predicted: np.ndarray, mode: str) -> float:
+    error = np.abs(np.asarray(actual) - np.asarray(predicted))
+    if mode == "mae":
+        return float(error.mean())
+    if mode == "price_weighted_mae":
+        weights = np.maximum(np.asarray(actual), 1e-6)
+        return float(np.sum(error * weights) / np.sum(weights))
+    raise ValueError(f"Unknown forecast loss: {mode}")
+
+
+def rolling_forecast(
+    values: np.ndarray,
+    i: int,
+    prior: np.ndarray,
+    validation_days: int = 28,
+    selection_loss: str = "mae",
+) -> tuple[np.ndarray, str]:
+    """Past-only rolling-origin model selection.
+
+    The default ``mae`` reproduces the reviewed Q4 candidate.  The optional
+    price-weighted loss is supplied as a sensitivity tool; it is not claimed to
+    be economically optimal without a separate chronological backtest.
+    """
+    if not i:
+        return np.asarray(prior, dtype=float).copy(), "cold_start_prior"
+    current = {name: candidate(values, i, name) for name in CANDIDATES}
+    current = {name: arr for name, arr in current.items() if arr is not None}
+    begin = max(7, i - validation_days)
+    scores: dict[str, float] = {}
+    for name in current:
+        losses = []
+        for j in range(begin, i):
+            pred = candidate(values, j, name)
+            if pred is not None:
+                losses.append(_forecast_loss(values[j], pred, selection_loss))
+        if losses:
+            scores[name] = float(np.mean(losses))
+    selected = min(scores, key=scores.get) if scores else ("lag7" if i >= 7 else "lag1")
+    return current[selected].copy(), selected
+
+
+def price_at(
+    prices: np.ndarray,
+    prior: np.ndarray,
+    day_index: int,
+    hour: int,
+    cfg: Q4Config,
+) -> tuple[np.ndarray, str]:
+    """Forecast remaining-day prices using only information available at hour."""
+    base, name = rolling_forecast(
+        prices,
+        day_index,
+        prior,
+        cfg.validation_days,
+        selection_loss=cfg.price_selection_loss,
+    )
+    start = hour * 6
+    out = base[start:].copy()
+    if start:
+        # Last completed hour only; no future actual price is read.
+        bias = float(np.mean(prices[day_index, start - 6 : start] - base[start - 6 : start]))
+        decay = np.exp(
+            -np.arange(len(out), dtype=float) / (6 * cfg.price_update_decay_hours)
+        )
+        out += cfg.price_update_weight * bias * decay
+    return np.maximum(out, cfg.price_floor), name
+
+
+def build_cache(data, prices: np.ndarray, base_cfg, cfg: Q4Config) -> dict:
+    """Precompute Q4-2/Q4-3 forecasts without leaking current/future actuals."""
+    published, pub_errors = core.make_forecast_cache(data, base_cfg)
+
+    historical_pv, historical_names = [], []
+    for i in range(len(data.dates)):
+        pv, name = rolling_forecast(
+            data.pv, i, np.zeros(T), cfg.validation_days, selection_loss="mae"
+        )
+        historical_pv.append(np.maximum(pv, 0.0) * DT)
+        historical_names.append(name)
+    historical_pv = np.asarray(historical_pv)
+
+    # Q4-2 intentionally does not use Attachment 3.
+    history_load = published[0][0]
+    historical_errors = (
+        (data.load - data.pv) * DT - (history_load - historical_pv)
+    )
+
+    price_forecast: dict[int, np.ndarray] = {}
+    price_errors: dict[int, np.ndarray] = {}
+    price_names: dict[int, list[str]] = {}
+    for hour in ISSUES:
+        pairs = [price_at(prices, data.price, i, hour, cfg) for i in range(len(data.dates))]
+        price_forecast[hour] = np.array([item[0] for item in pairs])
+        price_names[hour] = [item[1] for item in pairs]
+        price_errors[hour] = prices[:, hour * 6 :] - price_forecast[hour]
+
+    return {
+        "published": published,
+        "pub_errors": pub_errors,
+        "history_load": history_load,
+        "history_pv": historical_pv,
+        "hist_errors": historical_errors,
+        "hist_names": historical_names,
+        "price_forecast": price_forecast,
+        "price_errors": price_errors,
+        "price_names": price_names,
+    }
+
+
+def weighted_quantile(errors: np.ndarray, weights: np.ndarray, alpha: float) -> np.ndarray:
+    """Column-wise empirical inverse CDF while preserving scenario pairing."""
+    errors, weights = np.asarray(errors), np.asarray(weights)
+    if errors.shape != weights.shape or not (weights >= 0).all():
+        raise ValueError("Quantile weights must match and be nonnegative")
+    order = np.argsort(errors, axis=0, kind="stable")
+    x = np.take_along_axis(errors, order, axis=0)
+    w = np.take_along_axis(weights, order, axis=0)
+    totals = w.sum(axis=0)
+    if (totals <= 0).any():
+        raise ValueError("Positive column weight totals required")
+    k = np.argmax(np.cumsum(w, axis=0) >= alpha * totals, axis=0)
+    return x[k, np.arange(x.shape[1])]
+
+
+def risk_and_price(
+    history: np.ndarray,
+    price_errors: np.ndarray,
+    price_forecast: np.ndarray,
+    load: np.ndarray,
+    pv: np.ndarray,
+    alpha: float,
+    base_cfg,
+    cfg: Q4Config,
+    price_mode: str = "causal",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Price-aware risk proxy using paired historical net-load/price residuals."""
+    n = len(load)
+    if len(history) < base_cfg.min_residual_days:
+        return 0.05 * load + 0.08 * pv, np.zeros(n), price_forecast.copy()
+    if history.shape != price_errors.shape:
+        raise ValueError("Net-load and price histories must share dates and horizons")
+
+    if price_mode == "causal":
+        price_scenarios = np.maximum(
+            price_forecast[None, :] + price_errors, cfg.price_floor
+        )
+        # Bias-corrected scenario mean is the deterministic MILP procurement price.
+        cost_price = price_scenarios.mean(axis=0)
+    else:
+        price_scenarios = np.broadcast_to(price_forecast, history.shape)
+        cost_price = price_forecast.copy()
+
+    weights = (
+        price_scenarios
+        if cfg.risk_weighting == "price"
+        else np.ones_like(history, dtype=float)
+    )
+    margin = np.maximum(weighted_quantile(history, weights, alpha), 0.0)
+    remaining = history - margin
+    reserve = np.zeros(n)
+    for t in range(n):
+        path = np.cumsum(
+            remaining[:, t : min(n, t + base_cfg.reserve_horizon)], axis=1
+        )
+        reserve[t] = base_cfg.reserve_weight * np.quantile(
+            np.maximum(path.max(axis=1), 0.0), base_cfg.reserve_quantile
+        )
+    return margin, reserve, cost_price
+
+
+def stage_inputs(
+    data,
+    prices: np.ndarray,
+    cache: dict,
+    day_index: int,
+    hour: int,
+    pv_source: str,
+    price_mode: str,
+    base_cfg,
+    cfg: Q4Config,
+) -> dict:
+    start = hour * 6
+    left = max(0, day_index - base_cfg.lookback_days)
+
+    if pv_source == "history":
+        load = cache["history_load"][day_index, start:]
+        pv = cache["history_pv"][day_index, start:]
+        errors = cache["hist_errors"][left:day_index, start:]
+        pv_name = cache["hist_names"][day_index]
+    elif pv_source == "published":
+        load = cache["published"][hour][0][day_index]
+        pv = cache["published"][hour][1][day_index]
+        errors = cache["pub_errors"][hour][left:day_index]
+        pv_name = f"published_{hour:02d}"
+    else:
+        raise ValueError(pv_source)
+
+    if price_mode == "causal":
+        forecast = cache["price_forecast"][hour][day_index]
+        price_name = cache["price_names"][hour][day_index]
+    elif price_mode == "fixed":
+        forecast = data.price[start:].copy()
+        price_name = "attachment1_fixed_baseline"
+    elif price_mode == "known_day_ahead":
+        forecast = prices[day_index, start:].copy()
+        price_name = "EXPLICIT_KNOWN_DAY_AHEAD_ASSUMPTION"
+    else:
+        raise ValueError(price_mode)
+
+    price_error_history = cache["price_errors"][hour][left:day_index]
+    alpha = base_cfg.plan_quantile if hour == 0 else base_cfg.update_quantile
+    margin, reserve, objective_price = risk_and_price(
+        errors,
+        price_error_history,
+        forecast,
+        load,
+        pv,
+        alpha,
+        base_cfg,
+        cfg,
+        price_mode,
+    )
+
+    reference_mean = max(float(np.mean(data.price[start:])), cfg.price_floor)
+    scale = float(np.mean(objective_price) / reference_mean)
+    local_cfg = replace(
+        base_cfg,
+        terminal_penalty=base_cfg.terminal_penalty * scale,
+        reserve_penalty=base_cfg.reserve_penalty * scale,
+    )
+    return {
+        "load": load,
+        "pv": pv,
+        "margin": margin,
+        "reserve": reserve,
+        "price": objective_price,
+        "raw_price_forecast": forecast,
+        "local_cfg": local_cfg,
+        "price_model": price_name,
+        "pv_model": pv_name,
+        "penalty_scale": scale,
+        "history_days": day_index - left,
+    }
+
+
+def simulate_day(
+    data,
+    prices: np.ndarray,
+    cache: dict,
+    day_index: int,
+    start_soc: float,
+    hours: tuple[int, ...],
+    pv_source: str,
+    price_mode: str,
+    base_cfg,
+    cfg: Q4Config,
+):
+    active = np.zeros(T)
+    q0 = None
+    e = float(start_soc)
+    records, revisions, solves = [], [], []
+    midnight_price = midnight_objective_price = None
+
+    for t in range(T):
+        hour = t // 6
+        if t % 6 == 0 and hour in hours:
+            x = stage_inputs(
+                data,
+                prices,
+                cache,
+                day_index,
+                hour,
+                pv_source,
+                price_mode,
+                base_cfg,
+                cfg,
+            )
+            old = active[t:].copy()
+            sol = core.solve_remaining(
+                x["price"],
+                x["load"],
+                x["pv"],
+                e,
+                x["margin"],
+                x["reserve"],
+                x["local_cfg"],
+                None if hour == 0 else q0[t:],
+            )
+            if hour == 0:
+                q0 = sol["q"].copy()
+                midnight_price = x["raw_price_forecast"].copy()
+                midnight_objective_price = x["price"].copy()
+            active[t:] = sol["q"]
+
+            solves.append(
+                {
+                    "date": str(data.dates[day_index].date()),
+                    "issue_hour": hour,
+                    "price_model": x["price_model"],
+                    "pv_model": x["pv_model"],
+                    "start_soc_kwh": e,
+                    "proxy_objective": sol["objective"],
+                    "mip_gap": sol["mip_gap"],
+                    "mip_absolute_gap": sol["mip_absolute_gap"],
+                    "constraint_error": sol["max_constraint_error"],
+                    "max_reserve_slack_soc_kwh": float(sol["slack"].max()),
+                    "terminal_penalty": x["local_cfg"].terminal_penalty,
+                    "reserve_penalty": x["local_cfg"].reserve_penalty,
+                    "historical_days": x["history_days"],
+                }
+            )
+            for j in range(T - t):
+                revisions.append(
+                    {
+                        "date": str(data.dates[day_index].date()),
+                        "issue_hour": hour,
+                        "t": t + j,
+                        "interval": core.interval(t + j),
+                        "forecast_load_kwh": x["load"][j],
+                        "forecast_pv_kwh": x["pv"][j],
+                        "forecast_price": x["raw_price_forecast"][j],
+                        "objective_price": x["price"][j],
+                        "margin_kwh": x["margin"][j],
+                        "reserve_grid_kwh": x["reserve"][j],
+                        "q0_kwh": q0[t + j],
+                        "previous_active_kwh": old[j] if hour else q0[j],
+                        "new_active_kwh": sol["q"][j],
+                        "planned_charge_kwh": sol["c"][j],
+                        "planned_discharge_kwh": sol["d"][j],
+                        "planned_end_soc_kwh": sol["e"][j],
+                        "reserve_slack_soc_kwh": sol["slack"][j],
+                    }
+                )
+
+        start_e = e
+        load = data.load[day_index, t] * DT
+        pv = data.pv[day_index, t] * DT
+        c, d, e, emergency, spill = core.dispatch(
+            active[t], load, pv, e, base_cfg
+        )
+        records.append(
+            {
+                "date": str(data.dates[day_index].date()),
+                "t": t,
+                "start_time": str(data.dates[day_index] + pd.Timedelta(minutes=t * 10)),
+                "end_time": str(data.dates[day_index] + pd.Timedelta(minutes=(t + 1) * 10)),
+                "interval": core.interval(t),
+                "price": prices[day_index, t],
+                "forecast_price_0": midnight_price[t],
+                "objective_price_0": midnight_objective_price[t],
+                "q0_kwh": q0[t],
+                "active_kwh": active[t],
+                "load_kwh": load,
+                "pv_kwh": pv,
+                "charge_kwh": c,
+                "discharge_kwh": d,
+                "start_soc_kwh": start_e,
+                "end_soc_kwh": e,
+                "emergency_kwh": emergency,
+                "spill_kwh": spill,
+            }
+        )
+
+    df = pd.DataFrame(records)
+    fee = core.settlement(
+        df.price.to_numpy(),
+        df.q0_kwh.to_numpy(),
+        df.active_kwh.to_numpy(),
+        df.emergency_kwh.to_numpy(),
+        base_cfg.settlement,
+    )
+    for key, value in fee.items():
+        df[key] = value
+    df["total_cost"] = (
+        df.plan_cost
+        + df.up_cost
+        + df.down_penalty
+        - df.refund
+        + df.emergency_cost
+    )
+    df["storage_loss_kwh"] = (1 - base_cfg.eta_c) * df.charge_kwh + (
+        1 / base_cfg.eta_d - 1
+    ) * df.discharge_kwh
+    df["forecast_plan_cost"] = df.forecast_price_0 * df.q0_kwh
+    return e, df, revisions, solves
+
+
+def write_csv(frame: pd.DataFrame, path: Path) -> None:
+    """Atomic UTF-8-BOM CSV write with a row-count check."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(frame.columns)
+        for row in frame.itertuples(index=False, name=None):
+            writer.writerow(["" if pd.isna(x) else x for x in row])
+    with temporary.open(newline="", encoding="utf-8-sig") as stream:
+        count = sum(1 for _ in csv.reader(stream)) - 1
+    if count != len(frame):
+        raise RuntimeError(f"Incomplete CSV {path}: {count}/{len(frame)}")
+    temporary.replace(path)
+
+
+def _result_interval_label(index: int) -> str:
+    """Template labels are rotated by one 10-minute interval in official files."""
+    start = index * 10
+    end = (index + 1) * 10
+    def fmt(m: int) -> str:
+        if m == 1440:
+            return "0:00+1"
+        if m == 1450:
+            return "0:10+1"
+        return f"{m // 60}:{m % 60:02d}"
+    return f"{fmt(start)}-{fmt(end)}"
+
+
+def _clear_data_rows(sheet) -> None:
+    if sheet.max_row > 1:
+        sheet.delete_rows(2, sheet.max_row - 1)
+
+
+def _fill_purchase_sheet(sheet, rows: list, label: str) -> None:
+    headers = [sheet.cell(1, c).value for c in range(1, sheet.max_column + 1)]
+    try:
+        total_col = headers.index("全天购电量") + 1
+        cost_col = headers.index("全天购电费") + 1
+    except ValueError as exc:
+        raise ValueError(f"{label}缺少合计列") from exc
+    interval_cols = list(range(2, total_col))
+    if len(interval_cols) != T:
+        raise ValueError(f"{label}应有144个时段列")
+    canonical = [str(headers[c - 1]).replace("7:0-", "7:00-") for c in interval_cols]
+    if canonical[-1] == "0:00-0:10+1":
+        canonical[-1] = "0:00+1-0:10+1"
+    if canonical != [_result_interval_label(i) for i in range(1, T + 1)]:
+        raise ValueError(f"{label}时段表头与官方模板约定不符")
+    if sheet.max_row != len(rows) + 1:
+        raise ValueError(f"{label}日期行数与结果不一致")
+    template_dates = pd.DatetimeIndex(
+        [pd.Timestamp(sheet.cell(r, 1).value) for r in range(2, sheet.max_row + 1)]
+    ).normalize()
+    result_dates = pd.DatetimeIndex([pd.Timestamp(row[0]) for row in rows]).normalize()
+    if not template_dates.equals(result_dates):
+        raise ValueError(f"{label}日期与模板不一致")
+    for r, values in enumerate(rows, start=2):
+        natural = np.asarray(values[1 : 1 + T], dtype=float)
+        rotated = np.r_[natural[1:], natural[:1]]
+        for c, value in zip(interval_cols, rotated):
+            sheet.cell(r, c, float(max(0.0, value)))
+        sheet.cell(r, total_col, float(values[-2]))
+        sheet.cell(r, cost_col, float(values[-1]))
+
+
+def write_official_workbook(
+    template_path: Path,
+    output_path: Path,
+    tables: dict,
+    q43: bool,
+) -> None:
+    """Write only the official required sheets; diagnostics stay in 辅助输出."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(template_path, output_path)
+    workbook = load_workbook(output_path)
+    required = (
+        ["计划购电量", "调整购电量", "充放电量", "紧急购电量"]
+        if q43
+        else ["计划购电量", "充放电量", "紧急购电量"]
+    )
+    if workbook.sheetnames != required:
+        raise ValueError(
+            f"模板工作表应为{required}，实际为{workbook.sheetnames}"
+        )
+
+    _fill_purchase_sheet(workbook["计划购电量"], tables["计划购电量"]["rows"], "计划购电量")
+    if q43:
+        _fill_purchase_sheet(
+            workbook["调整购电量"], tables["调整购电量"]["rows"], "调整购电量"
+        )
+
+    storage = workbook["充放电量"]
+    storage_styles = [
+        [copy(storage.cell(2 + block, c)._style) for c in range(1, 7)]
+        for block in range(6)
+    ]
+    _clear_data_rows(storage)
+    for index, values in enumerate(tables["充放电量"]["rows"]):
+        row = index + 2
+        block = index % 6
+        for c in range(1, 7):
+            storage.cell(row, c)._style = copy(storage_styles[block][c - 1])
+        for c, value in enumerate(values, start=1):
+            if c == 1 and value is not None:
+                value = pd.Timestamp(value).to_pydatetime()
+            storage.cell(row, c, value)
+
+    emergency = workbook["紧急购电量"]
+    emergency_styles = [
+        [copy(emergency.cell(row, c)._style) for c in range(1, 4)]
+        for row in (2, 3, 4)
+    ]
+    emergency_date_format = emergency.cell(2, 1).number_format
+    _clear_data_rows(emergency)
+    events = pd.DataFrame(
+        tables["紧急购电量"]["rows"],
+        columns=tables["紧急购电量"]["headers"],
+    )
+    target_row = 2
+    for date, group in events.groupby("日期", sort=True):
+        items = list(group.itertuples(index=False, name=None))
+        for item_index, (_, period, amount) in enumerate(items):
+            if len(items) == 1 or item_index == len(items) - 1:
+                style_index = 2
+            elif item_index == 0:
+                style_index = 0
+            else:
+                style_index = 1
+            for c in range(1, 4):
+                emergency.cell(target_row, c)._style = copy(
+                    emergency_styles[style_index][c - 1]
+                )
+            emergency.cell(
+                target_row,
+                1,
+                pd.Timestamp(date).to_pydatetime() if item_index == 0 else None,
+            )
+            if item_index == 0:
+                emergency.cell(target_row, 1).number_format = emergency_date_format
+            emergency.cell(target_row, 2, period)
+            emergency.cell(
+                target_row, 3, None if pd.isna(amount) else float(amount)
+            )
+            target_row += 1
+
+    workbook.save(output_path)
+
+
+def write_case(
+    folder: Path,
+    df: pd.DataFrame,
+    revisions: list[dict],
+    solves: list[dict],
+    case: dict,
+    base_cfg,
+    cfg: Q4Config,
+) -> tuple[pd.DataFrame, dict, dict]:
+    folder.mkdir(parents=True, exist_ok=True)
+    checks = core.audit(df, base_cfg)
+    revisions_df = pd.DataFrame(revisions)
+    solver_log = pd.DataFrame(solves)
+    expected = int((T - 6 * solver_log.issue_hour).sum())
+    if len(revisions_df) != expected or not (
+        revisions_df.t >= 6 * revisions_df.issue_hour
+    ).all():
+        raise RuntimeError("Incomplete/retroactive revision history")
+    final = (
+        revisions_df.sort_values("issue_hour")
+        .drop_duplicates(["date", "t"], keep="last")
+    )
+    merged = df.merge(
+        final[["date", "t", "new_active_kwh"]],
+        on=["date", "t"],
+        validate="one_to_one",
+    )
+    if len(merged) != len(df):
+        raise RuntimeError("Incomplete final schedule trace")
+    trace_error = float(np.max(np.abs(merged.active_kwh - merged.new_active_kwh)))
+    if trace_error > 1e-5:
+        raise RuntimeError("Final schedule does not match issued plan")
+    checks.update(
+        revision_rows=len(revisions_df),
+        max_revision_trace_error_kwh=trace_error,
+    )
+
+    write_csv(df, folder / "q4_timeseries.csv")
+    for month, rows in revisions_df.groupby(revisions_df.date.str[:7], sort=True):
+        write_csv(rows, folder / "revision_logs" / f"q4_revisions_{month}.csv")
+    write_csv(solver_log, folder / "q4_solver_log.csv")
+
+    daily = core.daily_summary(df)
+    grouped = df.groupby("date")
+    daily["forecast_plan_cost"] = grouped.forecast_plan_cost.sum().to_numpy()
+    daily["price_mae_0"] = (
+        df.assign(price_error=np.abs(df.price - df.forecast_price_0))
+        .groupby("date")
+        .price_error.mean()
+        .to_numpy()
+    )
+    daily["mean_actual_price"] = grouped.price.mean().to_numpy()
+    write_csv(daily, folder / "q4_daily_summary.csv")
+
+    events = core.emergency_events(df)
+    write_csv(events, folder / "q4_emergency_events.csv")
+    (folder / "q4_audit.json").write_text(
+        json.dumps(checks, indent=2), encoding="utf-8"
+    )
+
+    tables = core.table_payload(df, daily, events)
+    if not case["name"].startswith("q4_3"):
+        tables.pop("调整购电量")
+    for name, obj in tables.items():
+        write_csv(
+            pd.DataFrame(obj["rows"], columns=obj["headers"]),
+            folder / f"{name}.csv",
+        )
+
+    selected = df[
+        df.date.isin(core.SELECTED) & df.t.isin([60, 72, 84, 96, 108, 120])
+    ]
+    write_csv(
+        selected[
+            ["date", "interval", "q0_kwh", "active_kwh", "emergency_kwh", "price"]
+        ],
+        folder / "selected_table1.csv",
+    )
+    write_csv(
+        daily[daily.date.isin(core.SELECTED)], folder / "selected_daily.csv"
+    )
+    storage = pd.DataFrame(
+        tables["充放电量"]["rows"], columns=tables["充放电量"]["headers"]
+    )
+    storage["日期"] = storage["日期"].ffill()
+    write_csv(
+        storage[storage["日期"].isin(core.SELECTED)], folder / "selected_table2.csv"
+    )
+    write_csv(
+        events[events["日期"].isin(core.SELECTED)], folder / "selected_table3.csv"
+    )
+
+    payload = {
+        "case": case,
+        "base_config": asdict(base_cfg),
+        "q4_config": asdict(cfg),
+        "tables": tables,
+        "dates": daily.date.tolist(),
+        "actual_price": df.price.to_numpy().reshape(-1, T).tolist(),
+        "forecast_price_0": df.forecast_price_0.to_numpy().reshape(-1, T).tolist(),
+        "daily": daily.to_dict("records"),
+    }
+    (folder / "q4_workbook_payload.json").write_text(
+        json.dumps(payload, ensure_ascii=False, allow_nan=False), encoding="utf-8"
+    )
+    return daily, checks, tables
+
+
+def evaluate_case(
+    data,
+    prices: np.ndarray,
+    cache: dict,
+    case: dict,
+    start_soc: float,
+    base_cfg,
+    cfg: Q4Config,
+    folder: Path,
+) -> tuple[dict, dict]:
+    e = float(start_soc)
+    frames: list[pd.DataFrame] = []
+    revisions: list[dict] = []
+    solves: list[dict] = []
+    for i, date in enumerate(data.dates):
+        if date < pd.Timestamp("2025-02-01"):
+            continue
+        e, df, rev, log = simulate_day(
+            data,
+            prices,
+            cache,
+            i,
+            e,
+            case["hours"],
+            case["pv_source"],
+            case["price_mode"],
+            base_cfg,
+            cfg,
+        )
+        frames.append(df)
+        revisions.extend(rev)
+        solves.extend(log)
+        if date.day == 1 or date == data.dates[-1]:
+            print(f'{case["name"]}: {date.date()} SOC={e:.3f}', flush=True)
+
+    df = pd.concat(frames, ignore_index=True)
+    daily, checks, tables = write_case(
+        folder, df, revisions, solves, case, base_cfg, cfg
+    )
+    inventory_rate = base_cfg.eta_d * float(np.min(data.price))
+    total = float(daily.total_cost.sum())
+    summary = {
+        "case": case["name"],
+        "pv_source": case["pv_source"],
+        "updates": ",".join(map(str, case["hours"])),
+        "price_information": case["price_mode"],
+        "days": len(daily),
+        "total_cost_yuan": total,
+        "plan_cost_yuan": float(daily.plan_cost.sum()),
+        "up_cost_yuan": float(daily.up_cost.sum()),
+        "down_penalty_yuan": float(daily.down_penalty.sum()),
+        "refund_yuan": float(daily.refund.sum()),
+        "emergency_cost_yuan": float(daily.emergency_cost.sum()),
+        "emergency_kwh": float(daily.emergency_kwh.sum()),
+        "emergency_days": int((daily.emergency_kwh > 1e-6).sum()),
+        "spill_kwh": float(daily.spill_kwh.sum()),
+        "price_forecast_mae_0": float(np.mean(np.abs(df.price - df.forecast_price_0))),
+        "price_forecast_rmse_0": float(
+            np.sqrt(np.mean((df.price - df.forecast_price_0) ** 2))
+        ),
+        "start_soc_kwh": start_soc,
+        "end_soc_kwh": e,
+        "inventory_value_yuan_per_soc_kwh": inventory_rate,
+        "inventory_adjusted_cost_yuan": total - inventory_rate * (e - start_soc),
+        "max_solver_relative_gap": max(x["mip_gap"] for x in solves),
+        "max_solver_absolute_gap": max(x["mip_absolute_gap"] for x in solves),
+        "audit_passed": checks["passed"],
+    }
+    return summary, tables
+
+
+def fit_diagnostics(data, prices: np.ndarray, cache: dict) -> pd.DataFrame:
+    """Honest evaluation-period diagnostics; never used to pick the annual winner."""
+    rows = []
+    start = int(np.where(data.dates >= pd.Timestamp("2025-02-01"))[0][0])
+    for hour in ISSUES:
+        actual = prices[start:, hour * 6 :]
+        predicted = cache["price_forecast"][hour][start:]
+        error = actual - predicted
+        rows.append(
+            {
+                "issue_hour": hour,
+                "mae_yuan_per_kwh": float(np.mean(np.abs(error))),
+                "rmse_yuan_per_kwh": float(np.sqrt(np.mean(error**2))),
+                "bias_yuan_per_kwh": float(np.mean(error)),
+                "price_weighted_mae": float(
+                    np.sum(np.abs(error) * np.maximum(actual, 1e-6))
+                    / np.sum(np.maximum(actual, 1e-6))
+                ),
+                "target_intervals_per_day": T - hour * 6,
+            }
+        )
+    # Fixed Attachment-1 baseline, 0:00 only, for the key fit comparison.
+    baseline = np.broadcast_to(data.price, prices[start:].shape)
+    error = prices[start:] - baseline
+    rows.append(
+        {
+            "issue_hour": "fixed_attachment1",
+            "mae_yuan_per_kwh": float(np.mean(np.abs(error))),
+            "rmse_yuan_per_kwh": float(np.sqrt(np.mean(error**2))),
+            "bias_yuan_per_kwh": float(np.mean(error)),
+            "price_weighted_mae": float(
+                np.sum(np.abs(error) * np.maximum(prices[start:], 1e-6))
+                / np.sum(np.maximum(prices[start:], 1e-6))
+            ),
+            "target_intervals_per_day": T,
+        }
+    )
+    return pd.DataFrame(rows)
+
+
+def _validate_repository_layout(args) -> None:
+    """Validate the required repository folders/files before running Q4."""
+    required_inputs = [
+        args.data_dir / "附件1.xlsx",
+        args.data_dir / "附件2.xlsx",
+        args.data_dir / "附件3.xlsx",
+        args.data_dir / "附件4.xlsx",
+        args.template42,
+        args.template43,
+        Q3_DIR / "q3_run_model.py",
+    ]
+    missing = [str(path) for path in required_inputs if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Q4运行所需文件缺失：\n  - " + "\n  - ".join(missing)
+        )
+
+    # Enforce the requested repository I/O contract by default: inputs come from
+    # 附件 and all generated artifacts stay under 提交结果. Explicit CLI
+    # overrides remain possible for smoke tests.
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.result42.parent.mkdir(parents=True, exist_ok=True)
+    args.result43.parent.mkdir(parents=True, exist_ok=True)
+
+
+def run(args) -> None:
+    _validate_repository_layout(args)
+    base_cfg = core.Config(
+        settlement=args.settlement,
+        eta_c=args.eta,
+        eta_d=args.eta,
+        plan_quantile=args.plan_quantile,
+        update_quantile=args.update_quantile,
+        reserve_weight=args.reserve_weight,
+        terminal_penalty=args.terminal_coef,
+        reserve_penalty=args.reserve_penalty,
+    )
+    cfg = Q4Config(
+        price_update_weight=args.price_update_weight,
+        risk_weighting=args.risk_weighting,
+        price_selection_loss=args.price_selection_loss,
+    )
+    data = core.read_inputs(args.data_dir, args.end)
+    if np.mean(data.price) <= 0:
+        raise ValueError("Positive Attachment-1 tariff reference required")
+    prices = read_prices(args.data_dir / "附件4.xlsx", data.dates)
+    cache = build_cache(data, prices, base_cfg, cfg)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # All candidate policies share one causal Q4-2 January warm-up from Jan 1 SOC=6000.
+    e = core.E_INIT
+    warm = []
+    for i, date in enumerate(data.dates):
+        if date >= pd.Timestamp("2025-02-01"):
+            break
+        e, frame, _, _ = simulate_day(
+            data, prices, cache, i, e, (0,), "history", "causal", base_cfg, cfg
+        )
+        warm.append(frame)
+    warm_df = pd.concat(warm, ignore_index=True)
+    core.audit(warm_df, base_cfg)
+    write_csv(warm_df, args.output_dir / "q4_january_warmup.csv")
+    initial = e
+
+    mode = args.price_information
+    definitions = {
+        "q4_2": dict(pv_source="history", hours=(0,), price_mode=mode),
+        "q4_3": dict(pv_source="published", hours=(0, 6, 12, 18), price_mode=mode),
+        "q4_3_only0": dict(pv_source="published", hours=(0,), price_mode=mode),
+        "q4_2_fixed": dict(pv_source="history", hours=(0,), price_mode="fixed"),
+        "q4_3_fixed": dict(
+            pv_source="published", hours=(0, 6, 12, 18), price_mode="fixed"
+        ),
+        "q4_3_fallback": dict(pv_source="history", hours=(0,), price_mode="fixed"),
+    }
+    names = (
+        ["q4_2", "q4_3", "q4_3_only0", "q4_2_fixed", "q4_3_fixed"]
+        if args.compare
+        else [x.strip() for x in args.cases.split(",") if x.strip()]
+    )
+    if len(names) != len(set(names)) or any(name not in definitions for name in names):
+        raise ValueError("Invalid/duplicate --cases")
+
+    summaries = []
+    tables_by_case = {}
+    for name in names:
+        case = {"name": name, **definitions[name]}
+        summary, tables = evaluate_case(
+            data,
+            prices,
+            cache,
+            case,
+            initial,
+            base_cfg,
+            cfg,
+            args.output_dir / name,
+        )
+        summaries.append(summary)
+        tables_by_case[name] = tables
+        write_csv(pd.DataFrame(summaries), args.output_dir / "q4_comparison.csv")
+
+    diagnostics = fit_diagnostics(data, prices, cache)
+    write_csv(diagnostics, args.output_dir / "q4_price_diagnostics.csv")
+    selection = pd.DataFrame(
+        {
+            "date": [str(x.date()) for x in data.dates],
+            "price_model": cache["price_names"][0],
+            "history_pv_model": cache["hist_names"],
+        }
+    )
+    write_csv(selection, args.output_dir / "q4_forecast_selection.csv")
+
+    meta = {
+        "base_config": asdict(base_cfg),
+        "q4_config": asdict(cfg),
+        "cases": [{**definitions[x], "name": x} for x in names],
+        "evaluation_start": "2025-02-01",
+        "evaluation_end": args.end,
+        "soc_jan1": core.E_INIT,
+        "soc_feb1": initial,
+        "price_range": [float(prices.min()), float(prices.max())],
+        "price_settlement": "actual price of each delivery interval",
+        "warmup": "common causal Q4-2 January",
+        "model": "price-aware quantile/reserve rolling MILP heuristic; no full stochastic recourse",
+        "selection": "past-only rolling-origin forecast selection",
+        "python": sys.version,
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "scipy": scipy.__version__,
+        "source_sha256": {
+            name: hashlib.sha256((args.data_dir / name).read_bytes()).hexdigest()
+            for name in ["附件1.xlsx", "附件2.xlsx", "附件3.xlsx", "附件4.xlsx"]
+        },
+    }
+    (args.output_dir / "q4_run_metadata.json").write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # Official templates contain the full Feb-Dec evaluation period.  Short --end
+    # runs are diagnostics/smoke tests and should not fail merely because the formal
+    # workbook has more date rows.
+    formal_ready = (
+        len(data.dates) == 365
+        and data.dates[0] == pd.Timestamp("2025-01-01")
+        and data.dates[-1] == pd.Timestamp("2025-12-31")
+    )
+    if formal_ready:
+        if "q4_2" in tables_by_case:
+            write_official_workbook(
+                args.template42,
+                args.result42,
+                tables_by_case["q4_2"],
+                q43=False,
+            )
+        if "q4_3" in tables_by_case:
+            write_official_workbook(
+                args.template43,
+                args.result43,
+                tables_by_case["q4_3"],
+                q43=True,
+            )
+
+    print(pd.DataFrame(summaries).to_string(index=False), flush=True)
+    print(f"Diagnostics: {args.output_dir}")
+    if formal_ready and "q4_2" in tables_by_case:
+        print(f"Formal Q4-2: {args.result42}")
+    if formal_ready and "q4_3" in tables_by_case:
+        print(f"Formal Q4-3: {args.result43}")
+    if not formal_ready and ({"q4_2", "q4_3"} & set(tables_by_case)):
+        print("Formal XLSX skipped: --end does not cover the full 2025 template period.")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=ATTACHMENT_DIR,
+                        help="输入目录，默认读取仓库根目录/附件")
+    parser.add_argument("--output-dir", type=Path, default=AUXILIARY_DIR,
+                        help="诊断与中间结果目录，默认写入提交结果/问题四_辅助输出")
+    parser.add_argument("--template4-2", dest="template42", type=Path,
+                        default=TEMPLATE_DIR / "result4-2.xlsx")
+    parser.add_argument("--template4-3", dest="template43", type=Path,
+                        default=TEMPLATE_DIR / "result4-3.xlsx")
+    parser.add_argument("--result4-2", dest="result42", type=Path,
+                        default=RESULT_DIR / "result4-2.xlsx")
+    parser.add_argument("--result4-3", dest="result43", type=Path,
+                        default=RESULT_DIR / "result4-3.xlsx")
+    parser.add_argument("--end", default="2025-12-31")
+    parser.add_argument("--cases", default="q4_2,q4_3")
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="also run q4_3_only0 and fixed-price decision baselines",
+    )
+    parser.add_argument(
+        "--price-information",
+        choices=["causal", "known_day_ahead"],
+        default="causal",
+        help="Q4 statement is ambiguous; causal is the conservative main interpretation",
+    )
+    parser.add_argument(
+        "--price-selection-loss",
+        choices=["mae", "price_weighted_mae"],
+        default="mae",
+        help="past-only loss used to select the daily price forecaster",
+    )
+    parser.add_argument("--settlement", choices=["no_refund", "refund"], default="no_refund")
+    parser.add_argument("--eta", type=float, default=0.9)
+    parser.add_argument("--plan-quantile", type=float, default=0.8)
+    parser.add_argument("--update-quantile", type=float, default=0.7)
+    parser.add_argument("--reserve-weight", type=float, default=1.0)
+    parser.add_argument("--risk-weighting", choices=["price", "uniform"], default="price")
+    parser.add_argument("--price-update-weight", type=float, default=0.5)
+    parser.add_argument("--terminal-coef", type=float, default=0.65)
+    parser.add_argument("--reserve-penalty", type=float, default=4.0)
+    args = parser.parse_args(argv)
+    if not (
+        0 < args.eta <= 1
+        and 0 < args.plan_quantile < 1
+        and 0 < args.update_quantile < 1
+        and args.reserve_weight >= 0
+        and 0 <= args.price_update_weight <= 1
+        and args.terminal_coef >= 0
+        and args.reserve_penalty >= 0
+    ):
+        parser.error("Invalid model parameters")
+    return args
+
+
+if __name__ == "__main__":
+    run(parse_args())

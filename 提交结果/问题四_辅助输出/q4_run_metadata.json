@@ -1,0 +1,72 @@
+{
+  "base_config": {
+    "settlement": "no_refund",
+    "eta_c": 0.9,
+    "eta_d": 0.9,
+    "plan_quantile": 0.8,
+    "update_quantile": 0.7,
+    "reserve_quantile": 0.95,
+    "reserve_horizon": 24,
+    "lookback_days": 56,
+    "min_residual_days": 7,
+    "reserve_weight": 1.0,
+    "reserve_penalty": 4.0,
+    "terminal_target": 6000.0,
+    "terminal_penalty": 0.65,
+    "load_bias_weight": 0.0,
+    "mip_gap": 1e-05,
+    "time_limit": 30.0,
+    "spill_tiebreak": 1e-07
+  },
+  "q4_config": {
+    "validation_days": 28,
+    "price_update_weight": 0.5,
+    "price_update_decay_hours": 6.0,
+    "price_floor": 1e-06,
+    "risk_weighting": "price",
+    "price_selection_loss": "mae"
+  },
+  "cases": [
+    {
+      "pv_source": "history",
+      "hours": [
+        0
+      ],
+      "price_mode": "causal",
+      "name": "q4_2"
+    },
+    {
+      "pv_source": "published",
+      "hours": [
+        0,
+        6,
+        12,
+        18
+      ],
+      "price_mode": "causal",
+      "name": "q4_3"
+    }
+  ],
+  "evaluation_start": "2025-02-01",
+  "evaluation_end": "2025-12-31",
+  "soc_jan1": 6000.0,
+  "soc_feb1": 7351.026421393297,
+  "price_range": [
+    0.0076,
+    1.7936
+  ],
+  "price_settlement": "actual price of each delivery interval",
+  "warmup": "common causal Q4-2 January",
+  "model": "price-aware quantile/reserve rolling MILP heuristic; no full stochastic recourse",
+  "selection": "past-only rolling-origin forecast selection",
+  "python": "3.13.14 (tags/v3.13.14:fd17997, Jun 10 2026, 13:03:48) [MSC v.1944 64 bit (AMD64)]",
+  "numpy": "2.3.2",
+  "pandas": "2.3.2",
+  "scipy": "1.16.1",
+  "source_sha256": {
+    "附件1.xlsx": "66b87134f5ecccd68184d3539bb1293ef039f9e0fdd955a589b9bfa7f227c377",
+    "附件2.xlsx": "2e95fd446bfafa0d8c59577b5c2e2ea8b3f1def20dde54a3062556f4da9b4c72",
+    "附件3.xlsx": "8a61b06c52bd0d639a1cc37c61a7d9f5b75edcbca718f64c1bd3498ec9f9d843",
+    "附件4.xlsx": "20e9c93aeab5e8e21ae4dd15587f9e190f7408692504c1319598461cd654fe71"
+  }
+}
